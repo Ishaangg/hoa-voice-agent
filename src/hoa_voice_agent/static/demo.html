@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HOA Voice Agent — Workflow Demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      background: #09110f;
+      color: #f0f7f4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 15% 20%, #174b3a 0, transparent 35%),
+        radial-gradient(circle at 90% 80%, #17304b 0, transparent 30%),
+        #09110f;
+    }
+    main {
+      width: min(760px, calc(100% - 32px));
+      min-height: 620px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+      border: 1px solid #2b5146;
+      border-radius: 24px;
+      background: rgb(10 23 19 / 92%);
+      box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+    }
+    header { padding: 26px 28px 18px; border-bottom: 1px solid #203d35; }
+    h1 { margin: 0; font-size: 1.3rem; font-weight: 650; letter-spacing: -.02em; }
+    header p { margin: 8px 0 0; color: #9eb8ae; font-size: .9rem; }
+    #messages {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 24px 28px;
+      overflow-y: auto;
+    }
+    .message {
+      max-width: 78%;
+      padding: 12px 15px;
+      border-radius: 16px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .agent { align-self: flex-start; background: #18342b; border-bottom-left-radius: 4px; }
+    .resident { align-self: flex-end; background: #1e5f48; border-bottom-right-radius: 4px; }
+    .system {
+      align-self: center;
+      color: #8ea89f;
+      font-size: .78rem;
+      background: transparent;
+      text-align: center;
+    }
+    form {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      padding: 18px;
+      border-top: 1px solid #203d35;
+    }
+    input, button {
+      border: 1px solid #31554a;
+      border-radius: 12px;
+      color: inherit;
+      font: inherit;
+    }
+    input { min-width: 0; padding: 12px 14px; background: #0f211b; outline: none; }
+    input:focus { border-color: #64c9a5; box-shadow: 0 0 0 3px rgb(100 201 165 / 14%); }
+    button { padding: 11px 16px; background: #1d7253; cursor: pointer; font-weight: 650; }
+    button:hover { background: #238662; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    #mic { width: 48px; padding: 0; background: #18342b; font-size: 1.1rem; }
+    #mic.listening { background: #8f3434; border-color: #db7676; }
+    @media (max-width: 560px) {
+      main { width: 100%; min-height: 100vh; border: 0; border-radius: 0; }
+      .message { max-width: 90%; }
+      header, #messages { padding-left: 18px; padding-right: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Pine Grove resident line</h1>
+      <p>Phase 1 workflow simulator · browser speech is for local testing only</p>
+    </header>
+    <section id="messages" aria-live="polite"></section>
+    <form id="turn-form">
+      <button id="mic" type="button" title="Speak" aria-label="Speak">●</button>
+      <input id="turn" autocomplete="off" placeholder="Ask about pool hours or report a leak…" disabled>
+      <button id="send" type="submit" disabled>Send</button>
+    </form>
+  </main>
+  <script>
+    const messages = document.querySelector("#messages");
+    const form = document.querySelector("#turn-form");
+    const input = document.querySelector("#turn");
+    const send = document.querySelector("#send");
+    const mic = document.querySelector("#mic");
+    let conversationId = null;
+    let recognitionListening = false;
+    let recognitionStartTimer = null;
+
+    function addMessage(text, role) {
+      const node = document.createElement("div");
+      node.className = `message ${role}`;
+      node.textContent = text;
+      messages.appendChild(node);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function speak(text) {
+      speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.04;
+      speechSynthesis.speak(utterance);
+    }
+
+    async function start() {
+      addMessage("Starting a simulated resident call…", "system");
+      const response = await fetch("/api/v1/conversations", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({caller_phone: "+15550101111"})
+      });
+      if (!response.ok) throw new Error("Could not start the conversation");
+      const data = await response.json();
+      conversationId = data.conversation_id;
+      addMessage(data.say, "agent");
+      input.disabled = false;
+      send.disabled = false;
+      input.focus();
+      speak(data.say);
+    }
+
+    async function submitTurn(text) {
+      addMessage(text, "resident");
+      input.value = "";
+      input.disabled = true;
+      send.disabled = true;
+      const response = await fetch(`/api/v1/conversations/${conversationId}/turns`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({text})
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Turn failed");
+      addMessage(data.say, "agent");
+      if (data.actions.length) {
+        addMessage(data.actions.map(action => action.type).join(" · "), "system");
+      }
+      speak(data.say);
+      input.disabled = false;
+      send.disabled = false;
+      input.focus();
+    }
+
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      try {
+        await submitTurn(text);
+      } catch (error) {
+        addMessage(error.message, "system");
+        input.disabled = false;
+        send.disabled = false;
+      }
+    });
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.lang = "en-US";
+      recognition.interimResults = false;
+      function reportVoiceIssue(reason) {
+        recognitionListening = false;
+        mic.classList.remove("listening");
+        if (recognitionStartTimer) window.clearTimeout(recognitionStartTimer);
+        addMessage(
+          `Voice input ${reason}. You can type your request here, or open this demo in Chrome and allow microphone access.`,
+          "system"
+        );
+      }
+      recognition.addEventListener("start", () => {
+        recognitionListening = true;
+        if (recognitionStartTimer) window.clearTimeout(recognitionStartTimer);
+        mic.classList.add("listening");
+      });
+      recognition.addEventListener("end", () => {
+        recognitionListening = false;
+        mic.classList.remove("listening");
+      });
+      recognition.addEventListener("error", event => {
+        const messages = {
+          "audio-capture": "could not access a microphone",
+          "network": "could not reach the speech-recognition service",
+          "not-allowed": "was blocked by microphone permissions",
+          "service-not-allowed": "is not allowed by this browser",
+        };
+        reportVoiceIssue(messages[event.error] || `stopped (${event.error})`);
+      });
+      recognition.addEventListener("result", event => {
+        input.value = event.results[0][0].transcript;
+        form.requestSubmit();
+      });
+      mic.addEventListener("click", () => {
+        if (recognitionListening) return;
+        try {
+          recognition.start();
+          recognitionStartTimer = window.setTimeout(() => {
+            if (!recognitionListening) reportVoiceIssue("did not start in this browser");
+          }, 1500);
+        } catch {
+          reportVoiceIssue("could not start");
+        }
+      });
+    } else {
+      mic.disabled = true;
+      mic.title = "Speech recognition is not available in this browser";
+    }
+
+    start().catch(error => addMessage(error.message, "system"));
+  </script>
+</body>
+</html>

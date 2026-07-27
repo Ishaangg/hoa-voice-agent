@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hoa-voice-agent"
+version = "0.1.0"
+description = "A deterministic, voice-ready HOA resident support backend."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "aiosqlite>=0.21,<1",
+    "asyncpg>=0.30,<1",
+    "fastapi>=0.116,<1",
+    "httpx>=0.28,<1",
+    "pydantic-settings>=2.10,<3",
+    "redis>=6,<7",
+    "sqlalchemy[asyncio]>=2.0.41,<3",
+    "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8.4,<9",
+    "pytest-asyncio>=1.1,<2",
+    "ruff>=0.12,<1",
+]
+voice = [
+    "pipecat-ai[nvidia,runner,webrtc]>=1.6,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hoa_voice_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
