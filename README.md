@@ -32,11 +32,20 @@ uvicorn hoa_voice_agent.api:app --reload
 Open:
 
 - Browser simulator: <http://localhost:8000/demo>
+- Operations dashboard: <http://localhost:8000/operations>
 - OpenAPI: <http://localhost:8000/docs>
 - Health: <http://localhost:8000/health>
 
-The known fake resident is `+15550101111`. The API uses a local SQLite database unless
-`DATABASE_URL` is set.
+The agent has no preloaded resident directory. Every incoming phone number creates a local,
+unverified caller profile. The agent asks for the caller's name and unit once, persists those
+claimed details, and uses them to resume later calls. The API uses a local SQLite database
+unless `DATABASE_URL` is set. This is operational context, not identity verification; require
+an SMS one-time code before exposing account-specific data.
+
+At startup, the demo seeds approved Pine Grove facts into the `community_knowledge` database
+table. These facts cover office, amenities, parking, emergency, and routing topics. The agent
+uses only active facts from that community when answering an HOA question; production should
+replace the demo seed with staff-managed entries from an admin interface.
 
 ## Run with PostgreSQL and Redis
 
@@ -87,6 +96,7 @@ ruff check .
 The workflow demo uses a temporary browser speech-recognition API. The real audio path is
 the separate Pipecat process below. It streams browser microphone audio through NVIDIA
 Nemotron ASR and Magpie TTS, while keeping the deterministic HOA controller in the middle.
+It uses VAD plus a short silence timeout to finish each resident turn reliably.
 
 Set `NVIDIA_API_KEY` in `.env` for NVIDIA's hosted services, then install and run:
 
@@ -94,6 +104,16 @@ Set `NVIDIA_API_KEY` in `.env` for NVIDIA's hosted services, then install and ru
 python -m pip install -e ".[voice]"
 python -m hoa_voice_agent.voice.bot -t webrtc
 ```
+
+If NVIDIA's hosted ASR is unavailable, use a local Whisper fallback instead:
+
+```env
+VOICE_STT_PROVIDER=local_whisper
+WHISPER_MODEL=base
+WHISPER_COMPUTE_TYPE=int8
+```
+
+The first startup downloads the selected Whisper model. NVIDIA TTS and LLM remain hosted.
 
 Open <http://localhost:7860/client> and allow its microphone prompt. This process starts
 its own local WebRTC development runner; it uses the same database and Fake Community data

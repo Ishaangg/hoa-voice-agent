@@ -29,7 +29,13 @@ async def start_conversation(client: httpx.AsyncClient) -> str:
         json={"caller_phone": "+15550101111"},
     )
     assert response.status_code == 201
-    return response.json()["conversation_id"]
+    conversation_id = response.json()["conversation_id"]
+    details = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "My name is Alex and I am in Unit 204."},
+    )
+    assert details.status_code == 200
+    return conversation_id
 
 
 async def test_health(client: httpx.AsyncClient) -> None:
@@ -39,15 +45,17 @@ async def test_health(client: httpx.AsyncClient) -> None:
     assert response.json()["status"] == "ok"
 
 
-async def test_known_resident_gets_personalized_greeting(client: httpx.AsyncClient) -> None:
+async def test_new_caller_starts_with_an_unverified_profile(client: httpx.AsyncClient) -> None:
     response = await client.post(
         "/api/v1/conversations",
         json={"caller_phone": "+15550101111"},
     )
 
     assert response.status_code == 201
-    assert response.json()["say"].startswith("Hi Alex")
-    assert response.json()["resident_id"] is not None
+    payload = response.json()
+    assert payload["state"] == "awaiting_resident_details"
+    assert payload["resident_id"] is None
+    assert "name and unit number" in payload["say"]
 
 
 async def test_unknown_caller_is_asked_for_name_and_unit_before_routine_help(
@@ -71,6 +79,76 @@ async def test_unknown_caller_is_asked_for_name_and_unit_before_routine_help(
     assert details.status_code == 200
     assert details.json()["intent"] == "conversation"
     assert "Jordan Smith in Unit 407" in details.json()["say"]
+
+    repeat_call = await client.post(
+        "/api/v1/conversations",
+        json={"caller_phone": "+15550102222"},
+    )
+
+    assert repeat_call.status_code == 201
+    assert repeat_call.json()["state"] == "ready"
+    assert "Welcome back, Jordan Smith in Unit 407" in repeat_call.json()["say"]
+
+
+async def test_caller_can_correct_a_claimed_unit_after_intake(client: httpx.AsyncClient) -> None:
+    first_call = await client.post(
+        "/api/v1/conversations",
+        json={"caller_phone": "+15550102223"},
+    )
+    conversation_id = first_call.json()["conversation_id"]
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "My name is Ishan and my unit number is seven."},
+    )
+
+    correction = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "Actually, I want to change my unit number. It is three zero four."},
+    )
+    assert "Unit 304" in correction.json()["say"]
+    assert "Should I update" in correction.json()["say"]
+
+    confirmation = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "Yes"},
+    )
+    assert "updated your unit to Unit 304" in confirmation.json()["say"]
+
+    repeat_call = await client.post(
+        "/api/v1/conversations",
+        json={"caller_phone": "+15550102223"},
+    )
+    assert "Welcome back, Ishan in Unit 304" in repeat_call.json()["say"]
+
+
+async def test_caller_can_use_natural_language_to_correct_profile_details(
+    client: httpx.AsyncClient,
+) -> None:
+    first_call = await client.post(
+        "/api/v1/conversations",
+        json={"caller_phone": "+15550102224"},
+    )
+    conversation_id = first_call.json()["conversation_id"]
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "My name is Ishan and my unit number is seven."},
+    )
+
+    correction = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "No, that's wrong. I live in 304."},
+    )
+    assert "Unit 304" in correction.json()["say"]
+
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "Yes"},
+    )
+    name_correction = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "Please call me Priya."},
+    )
+    assert "your name to Priya" in name_correction.json()["say"]
 
 
 async def test_unknown_caller_emergency_is_not_delayed_for_intake(
@@ -112,6 +190,21 @@ async def test_faq_turn_returns_community_answer(client: httpx.AsyncClient) -> N
     assert payload["intent"] == "faq"
     assert "9 PM" in payload["say"]
     assert payload["actions"] == []
+
+
+async def test_community_knowledge_base_answers_guest_parking_question(
+    client: httpx.AsyncClient,
+) -> None:
+    conversation_id = await start_conversation(client)
+
+    response = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "Can my guest park overnight?"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["intent"] == "faq"
+    assert "guest pass" in response.json()["say"]
 
 
 async def test_active_leak_creates_work_order_sms_and_transfer(
@@ -172,3 +265,38 @@ async def test_missing_conversation_returns_404(client: httpx.AsyncClient) -> No
     )
 
     assert response.status_code == 404
+
+
+async def test_operations_dashboard_exposes_kpis_events_and_transcript(
+    client: httpx.AsyncClient,
+) -> None:
+    conversation_id = await start_conversation(client)
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "Water is leaking from the ceiling in the hallway."},
+    )
+
+    dashboard = await client.get("/operations")
+    assert dashboard.status_code == 200
+    assert "Operations Control Room" in dashboard.text
+
+    summary = await client.get("/api/v1/operations/summary")
+    assert summary.status_code == 200
+    assert summary.json()["calls"] >= 1
+    assert summary.json()["open_work_orders"] >= 1
+    assert summary.json()["emergency_escalations"] >= 1
+
+    transcript = await client.get(
+        f"/api/v1/operations/transcripts/{conversation_id}"
+    )
+    assert [turn["speaker"] for turn in transcript.json()] == [
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+    events = await client.get("/api/v1/operations/events")
+    event_types = {event["event_type"] for event in events.json()}
+    assert {"work_order_created", "sms_queued", "transfer_requested"} <= event_types

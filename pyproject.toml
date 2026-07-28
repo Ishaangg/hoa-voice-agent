@@ -27,7 +27,7 @@ dev = [
     "ruff>=0.12,<1",
 ]
 voice = [
-    "pipecat-ai[nvidia,runner,webrtc]>=1.6,<2",
+    "pipecat-ai[nvidia,runner,webrtc,whisper]>=1.6,<2",
 ]
 
 [tool.hatch.build.targets.wheel]

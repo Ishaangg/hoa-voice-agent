@@ -26,7 +26,11 @@ from hoa_voice_agent.domain.models import (
     WorkOrder,
 )
 from hoa_voice_agent.persistence.repository import (
+    CallerProfileRepository,
+    CommunityKnowledgeRepository,
     ConversationRepository,
+    ConversationTurnRepository,
+    WorkflowEventRepository,
     WorkOrderRepository,
 )
 
@@ -101,7 +105,11 @@ class ConversationService:
         conversation_responder: ConversationResponder | None = None,
     ) -> None:
         self.conversations = ConversationRepository(session)
+        self.caller_profiles = CallerProfileRepository(session)
+        self.community_knowledge = CommunityKnowledgeRepository(session)
+        self.turns = ConversationTurnRepository(session)
         self.work_orders = WorkOrderRepository(session)
+        self.workflow_events = WorkflowEventRepository(session)
         self.community_management = community_management
         self.messaging = messaging
         self.call_control = call_control
@@ -115,14 +123,22 @@ class ConversationService:
             raise CommunityNotFoundError
 
         resident = await self.community_management.find_resident(caller_phone)
+        caller_profile = await self.caller_profiles.get_or_create(
+            management_company_id=community.management_company_id,
+            community_id=community.community_id,
+            caller_phone=caller_phone,
+        )
+        has_claimed_context = bool(caller_profile.claimed_name and caller_profile.claimed_unit)
         conversation = await self.conversations.create(
             management_company_id=community.management_company_id,
             community_id=community.community_id,
             caller_phone=caller_phone,
             resident_id=resident.id if resident else None,
+            caller_name=caller_profile.claimed_name,
+            caller_unit=caller_profile.claimed_unit,
             state=(
                 ConversationState.READY
-                if resident
+                if resident or has_claimed_context
                 else ConversationState.AWAITING_RESIDENT_DETAILS
             ),
         )
@@ -131,10 +147,16 @@ class ConversationService:
             "How can I help?"
             if resident
             else (
-                f"Thank you for calling {community.name}. Before I help, please tell me "
-                "your name and unit number."
+                f"Welcome back, {caller_profile.claimed_name} in {caller_profile.claimed_unit}. "
+                "How can I help?"
+                if has_claimed_context
+                else (
+                    f"Thank you for calling {community.name}. Before I help, please tell me "
+                    "your name and unit number."
+                )
             )
         )
+        await self.turns.add(conversation.id, "assistant", greeting)
         return StartConversationResponse(
             conversation_id=conversation.id,
             community_id=conversation.community_id,
@@ -149,6 +171,7 @@ class ConversationService:
         text: str,
     ) -> ConversationTurnResponse:
         conversation, community = await self._load_conversation_context(conversation_id)
+        await self.turns.add(conversation.id, "user", text)
 
         normalized = " ".join(text.lower().split())
         intake_response = await self._handle_missing_resident_details(
@@ -158,14 +181,18 @@ class ConversationService:
         )
         if intake_response:
             return intake_response
+        profile_update_response = await self._handle_profile_update(conversation, text)
+        if profile_update_response:
+            return profile_update_response
         if self._looks_like_maintenance(normalized):
             return await self._handle_maintenance(conversation, community, text)
 
+        faqs = await self.community_knowledge.active_facts(community.community_id)
         if self.conversation_responder:
             answer = await self.conversation_responder.reply(
                 text=text,
                 community_name=community.name,
-                faqs=community.faqs,
+                faqs=faqs,
             )
             if answer:
                 return ConversationTurnResponse(
@@ -174,7 +201,7 @@ class ConversationService:
                     say=answer,
                 )
 
-        faq_answer = self._find_faq_answer(normalized, community.faqs)
+        faq_answer = self._find_faq_answer(normalized, faqs)
         if faq_answer:
             return ConversationTurnResponse(
                 conversation_id=conversation.id,
@@ -195,6 +222,7 @@ class ConversationService:
         """Keep safety actions local; stream every ordinary turn through the LLM."""
 
         conversation, community = await self._load_conversation_context(conversation_id)
+        await self.turns.add(conversation.id, "user", text)
         normalized = " ".join(text.lower().split())
         intake_response = await self._handle_missing_resident_details(
             conversation,
@@ -203,13 +231,15 @@ class ConversationService:
         )
         if intake_response:
             return VoiceTurnRoute(response=intake_response)
+        profile_update_response = await self._handle_profile_update(conversation, text)
+        if profile_update_response:
+            return VoiceTurnRoute(response=profile_update_response)
         if self._looks_like_maintenance(normalized):
             return VoiceTurnRoute(
                 response=await self._handle_maintenance(conversation, community, text)
             )
-        return VoiceTurnRoute(
-            system_prompt=self._voice_system_prompt(community.name, community.faqs)
-        )
+        faqs = await self.community_knowledge.active_facts(community.community_id)
+        return VoiceTurnRoute(system_prompt=self._voice_system_prompt(community.name, faqs))
 
     async def _load_conversation_context(self, conversation_id: UUID):
         conversation = await self.conversations.get(conversation_id)
@@ -235,6 +265,15 @@ class ConversationService:
 
         name, unit = self._extract_caller_details(text)
         updated = await self.conversations.set_caller_details(conversation, name=name, unit=unit)
+        await self.caller_profiles.set_claimed_details(
+            await self.caller_profiles.get_or_create(
+                management_company_id=updated.management_company_id,
+                community_id=updated.community_id,
+                caller_phone=updated.caller_phone,
+            ),
+            name=name,
+            unit=unit,
+        )
         if updated.caller_name and updated.caller_unit:
             say = (
                 f"Thanks, {updated.caller_name} in {updated.caller_unit}. "
@@ -250,6 +289,70 @@ class ConversationService:
             conversation_id=conversation.id,
             intent=Intent.CONVERSATION,
             say=say,
+        )
+
+    async def _handle_profile_update(
+        self,
+        conversation,
+        text: str,
+    ) -> ConversationTurnResponse | None:
+        normalized = " ".join(text.lower().split())
+        if conversation.pending_caller_name or conversation.pending_caller_unit:
+            if normalized in {"yes", "yes please", "confirm", "correct"}:
+                pending_name = conversation.pending_caller_name
+                pending_unit = conversation.pending_caller_unit
+                updated = await self.conversations.set_caller_details(
+                    conversation,
+                    name=pending_name,
+                    unit=pending_unit,
+                )
+                profile = await self.caller_profiles.get_or_create(
+                    management_company_id=updated.management_company_id,
+                    community_id=updated.community_id,
+                    caller_phone=updated.caller_phone,
+                )
+                await self.caller_profiles.set_claimed_details(
+                    profile,
+                    name=updated.caller_name,
+                    unit=updated.caller_unit,
+                )
+                await self.conversations.clear_pending_caller_update(updated)
+                changes = []
+                if pending_name:
+                    changes.append(f"your name to {updated.caller_name}")
+                if pending_unit:
+                    changes.append(f"your unit to {updated.caller_unit}")
+                return ConversationTurnResponse(
+                    conversation_id=conversation.id,
+                    intent=Intent.CONVERSATION,
+                    say=f"I've updated {' and '.join(changes)}. How can I help today?",
+                )
+            if normalized in {"no", "no thanks", "cancel", "never mind"}:
+                await self.conversations.clear_pending_caller_update(conversation)
+                return ConversationTurnResponse(
+                    conversation_id=conversation.id,
+                    intent=Intent.CONVERSATION,
+                    say="No changes were made. How can I help today?",
+                )
+            return ConversationTurnResponse(
+                conversation_id=conversation.id,
+                intent=Intent.CONVERSATION,
+                say="Please say yes to confirm the update, or no to cancel it.",
+            )
+
+        name, unit = self._extract_profile_correction(text)
+        if not name and not unit:
+            return None
+        await self.conversations.set_pending_caller_update(conversation, name=name, unit=unit)
+        changes = []
+        if name:
+            changes.append(f"your name to {name}")
+        if unit:
+            changes.append(f"your unit to {unit}")
+        return ConversationTurnResponse(
+            conversation_id=conversation.id,
+            intent=Intent.CONVERSATION,
+            say=f"I heard {' and '.join(changes)}. Should I update your caller profile?",
         )
 
     async def _handle_maintenance(
@@ -279,6 +382,12 @@ class ConversationService:
                 reference_id=work_order.id,
             )
         ]
+        await self.workflow_events.add(
+            conversation.id,
+            ActionType.WORK_ORDER_CREATED.value,
+            f"{decision.priority.value} work order created",
+            work_order.id,
+        )
 
         sms_sent = False
         resident = await self.community_management.find_resident(conversation.caller_phone)
@@ -303,6 +412,12 @@ class ConversationService:
                     reference_id=work_order.id,
                 )
             )
+            await self.workflow_events.add(
+                conversation.id,
+                ActionType.SMS_QUEUED.value,
+                sms_reference,
+                work_order.id,
+            )
         except Exception as exc:
             logger.error("Confirmation SMS failed for work order {}: {}", work_order.id, exc)
             actions.append(
@@ -311,6 +426,12 @@ class ConversationService:
                     detail="confirmation SMS failed",
                     reference_id=work_order.id,
                 )
+            )
+            await self.workflow_events.add(
+                conversation.id,
+                ActionType.SMS_FAILED.value,
+                "confirmation SMS failed",
+                work_order.id,
             )
 
         if decision.transfer_to_on_call:
@@ -324,6 +445,12 @@ class ConversationService:
                     detail=transfer_reference,
                     reference_id=work_order.id,
                 )
+            )
+            await self.workflow_events.add(
+                conversation.id,
+                ActionType.TRANSFER_REQUESTED.value,
+                transfer_reference,
+                work_order.id,
             )
 
         spoken_parts = list(decision.instructions)
@@ -344,6 +471,9 @@ class ConversationService:
             decision=decision,
             work_order=work_order,
         )
+
+    async def record_assistant_turn(self, conversation_id: UUID, text: str) -> None:
+        await self.turns.add(conversation_id, "assistant", text)
 
     def _looks_like_maintenance(self, text: str) -> bool:
         return any(term in text for term in self._maintenance_terms)
@@ -371,7 +501,8 @@ class ConversationService:
         name_match = re.search(
             r"\b(?:my name is|this is|i am|i'm|name is)\s+"
             r"([a-z][a-z '-]{1,70}?)(?=\s+(?:and\s+)?(?:my\s+)?(?:i am\s+)?"
-            r"(?:in\s+)?(?:unit(?:\s+number)?|apt(?:artment)?|flat)\b|[,.]|$)",
+            r"(?:in\s+)?(?:unit(?:\s+number)?|apt(?:artment)?|flat)\b"
+            r"|\s+and\s+(?:my\s+)?number\b|[,.]|$)",
             text,
             flags=re.IGNORECASE,
         )
@@ -385,6 +516,51 @@ class ConversationService:
         unit = (
             f"Unit {ConversationService._normalize_spoken_unit(unit_match.group(1))}"
             if unit_match
+            else None
+        )
+        return name, unit
+
+    @staticmethod
+    def _extract_profile_correction(text: str) -> tuple[str | None, str | None]:
+        name_match = re.search(
+            r"\b(?:change|update|correct|fix)\s+(?:my\s+)?name\s+(?:to|is)\s+"
+            r"([a-z][a-z '-]{1,70}?)(?=[,.]|$)"
+            r"|\b(?:please\s+)?call\s+me\s+([a-z][a-z '-]{1,70}?)(?=[,.]|$)"
+            r"|\b(?:that(?:'s| is)\s+(?:not|wrong)|no),?\s*(?:my\s+)?name\s+is\s+"
+            r"([a-z][a-z '-]{1,70}?)(?=[,.]|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        unit_match = re.search(
+            r"\b(?:change|update|correct|fix)\s+(?:my\s+)?"
+            r"(?:unit\s+number|unit|apt(?:artment)?|flat)"
+            r"(?:\s+(?:to|is)\s+|[,.]\s*(?:(?:it\s+)?is\s+)?|\s+(?:it\s+)?is\s+)"
+            r"#?\s*([a-z0-9][a-z0-9 -]{0,40}?)(?=[,.]|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not unit_match:
+            unit_match = re.search(
+                r"\b(?:that(?:'s| is)\s+(?:not|wrong)|no)[\s,.-]*"
+                r"(?:i\s+(?:live|stay|reside)\s+(?:in|at)|my\s+"
+                r"(?:unit|apartment|apt|flat)\s+is)\s*"
+                r"(?:unit|apartment|apt|flat)?\s*#?\s*([a-z0-9][a-z0-9 -]{0,40}?)(?=[,.]|$)"
+                r"|\b(?:i\s+)?moved\s+(?:to|into)\s+"
+                r"(?:unit|apartment|apt|flat)?\s*#?\s*([a-z0-9][a-z0-9 -]{0,40}?)(?=[,.]|$)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        name = next((group for group in name_match.groups() if group), None) if name_match else None
+        if name:
+            name = name.strip(" .,-")
+        unit_value = (
+            next((group for group in unit_match.groups() if group), None)
+            if unit_match
+            else None
+        )
+        unit = (
+            f"Unit {ConversationService._normalize_spoken_unit(unit_value)}"
+            if unit_value
             else None
         )
         return name, unit

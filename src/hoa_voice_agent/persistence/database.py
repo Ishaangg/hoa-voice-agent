@@ -33,7 +33,12 @@ class Database:
         """Keep the local prototype database compatible with additive schema changes."""
 
         columns = {column["name"] for column in inspect(connection).get_columns("conversations")}
-        for name in ("caller_name", "caller_unit"):
+        for name in (
+            "caller_name",
+            "caller_unit",
+            "pending_caller_name",
+            "pending_caller_unit",
+        ):
             if name not in columns:
                 connection.execute(
                     text(f"ALTER TABLE conversations ADD COLUMN {name} VARCHAR(120)")

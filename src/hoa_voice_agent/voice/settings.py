@@ -8,6 +8,10 @@ class VoiceRuntimeSettings(BaseSettings):
     """Configuration for the separately-run Pipecat browser voice process."""
 
     database_url: str = "sqlite+aiosqlite:///./hoa_voice_agent.db"
+    voice_stt_provider: Literal["nvidia", "local_whisper"] = "nvidia"
+    whisper_model: str = "base"
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "int8"
     nvidia_api_key: str | None = None
     nvidia_stt_server: str = "grpc.nvcf.nvidia.com:443"
     nvidia_tts_server: str = "grpc.nvcf.nvidia.com:443"
@@ -44,7 +48,7 @@ class VoiceRuntimeSettings(BaseSettings):
     def require_key_for_nvidia_cloud(self) -> "VoiceRuntimeSettings":
         cloud_servers = (self.nvidia_stt_server, self.nvidia_tts_server)
         uses_nvidia_cloud = any("nvcf.nvidia.com" in server for server in cloud_servers)
-        if uses_nvidia_cloud and not self.nvidia_api_key:
+        if (self.voice_stt_provider == "nvidia" or uses_nvidia_cloud) and not self.nvidia_api_key:
             raise ValueError(
                 "NVIDIA_API_KEY is required when using NVIDIA's hosted Nemotron Speech endpoints. "
                 "For self-hosted NIM, set NVIDIA_STT_SERVER and NVIDIA_TTS_SERVER "

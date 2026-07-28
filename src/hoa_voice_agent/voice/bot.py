@@ -10,8 +10,6 @@ from __future__ import annotations
 from contextlib import suppress
 
 from loguru import logger
-from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
@@ -29,7 +27,7 @@ from pipecat.services.nvidia.stt import NvidiaSTTService
 from pipecat.services.nvidia.tts import NvidiaTTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from hoa_voice_agent.adapters.fake import (
@@ -41,10 +39,36 @@ from hoa_voice_agent.adapters.fake import (
 from hoa_voice_agent.adapters.twilio import TwilioMessagingAdapter
 from hoa_voice_agent.persistence import tables as _tables  # noqa: F401
 from hoa_voice_agent.persistence.database import Database
+from hoa_voice_agent.persistence.seed import seed_demo_community_knowledge
 from hoa_voice_agent.services.conversation import ConversationService
 from hoa_voice_agent.services.nvidia_incident_extractor import NvidiaIncidentExtractor
 from hoa_voice_agent.voice.settings import VoiceRuntimeSettings
 from hoa_voice_agent.voice.workflow_processor import HOAWorkflowProcessor
+
+
+def create_stt(settings: VoiceRuntimeSettings):
+    if settings.voice_stt_provider == "nvidia":
+        return NvidiaSTTService(
+            api_key=settings.nvidia_api_key,
+            server=settings.nvidia_stt_server,
+            use_ssl=settings.use_ssl_for(settings.nvidia_stt_server),
+            model_function_map={
+                "function_id": settings.nvidia_stt_function_id,
+                "model_name": settings.nvidia_stt_model,
+            },
+        )
+
+    try:
+        from pipecat.services.whisper.stt import WhisperSTTService
+    except ImportError as exc:
+        raise RuntimeError(
+            "Local Whisper is not installed. Run: python -m pip install -e \".[voice]\""
+        ) from exc
+    return WhisperSTTService(
+        settings=WhisperSTTService.Settings(model=settings.whisper_model),
+        device=settings.whisper_device,
+        compute_type=settings.whisper_compute_type,
+    )
 
 
 async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSettings) -> None:
@@ -54,6 +78,7 @@ async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSetting
     await database.create_schema()
     session = database.session_factory()
     try:
+        await seed_demo_community_knowledge(session)
         community_management = FakeCommunityManagementAdapter()
         messaging = (
             TwilioMessagingAdapter(
@@ -80,15 +105,7 @@ async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSetting
             COMMUNITY_ID,
         )
 
-        stt = NvidiaSTTService(
-            api_key=settings.nvidia_api_key,
-            server=settings.nvidia_stt_server,
-            use_ssl=settings.use_ssl_for(settings.nvidia_stt_server),
-            model_function_map={
-                "function_id": settings.nvidia_stt_function_id,
-                "model_name": settings.nvidia_stt_model,
-            },
-        )
+        stt = create_stt(settings)
         tts = NvidiaTTSService(
             api_key=settings.nvidia_api_key,
             server=settings.nvidia_tts_server,
@@ -116,17 +133,16 @@ async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSetting
         aggregators = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
-                # Fast VAD starts Smart Turn analysis after a short pause. Smart Turn then
-                # distinguishes a completed resident thought from a mid-sentence pause.
+                # Use VAD plus a short speech timeout to commit a transcript reliably.
+                # Smart Turn can hold a browser session open indefinitely when its local
+                # analyzer fails to receive a clean end-of-speech signal.
                 vad_analyzer=SileroVADAnalyzer(
                     params=VADParams(stop_secs=settings.voice_vad_stop_secs)
                 ),
                 user_turn_strategies=UserTurnStrategies(
                     stop=[
-                        TurnAnalyzerUserTurnStopStrategy(
-                            turn_analyzer=LocalSmartTurnAnalyzerV3(
-                                params=SmartTurnParams(stop_secs=settings.voice_turn_stop_secs)
-                            )
+                        SpeechTimeoutUserTurnStopStrategy(
+                            user_speech_timeout=settings.voice_turn_stop_secs
                         )
                     ]
                 ),

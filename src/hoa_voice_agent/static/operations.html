@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operations Control Room</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; background: var(--bg); color: var(--text); --bg: #f4f7fb; --panel: #ffffff; --panel-soft: #eef4fa; --line: #d6e0eb; --line-soft: #e6edf4; --text: #172033; --muted: #64748b; --accent: #1687c4; --accent-soft: #dceffd; --accent-text: #075985; --danger: #c2413a; --violet: #7654c7; --amber: #b77908; --green: #16845e; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); transition: background .2s ease, color .2s ease; }
+    main { width: min(1400px, calc(100% - 36px)); margin: 0 auto; padding: 28px 0 48px; }
+    header { display: flex; justify-content: space-between; align-items: end; gap: 20px; margin-bottom: 24px; border-bottom: 1px solid var(--line); padding-bottom: 22px; }
+    h1, h2, p { margin: 0; } h1 { font-size: 28px; letter-spacing: -0.02em; } h2 { font-size: 15px; }
+    .muted { color: var(--muted); font-size: 13px; margin-top: 7px; }
+    button { border: 1px solid var(--line); background: var(--panel-soft); color: var(--text); border-radius: 7px; padding: 9px 13px; cursor: pointer; }
+    button:hover, button.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+    .kpis { display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .card, section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px #17203314; }
+    section:nth-child(1) { border-top: 3px solid var(--accent); }
+    section:nth-child(2) { border-top: 3px solid var(--amber); }
+    section:nth-child(3) { border-top: 3px solid var(--violet); }
+    section:nth-child(4) { border-top: 3px solid var(--danger); }
+    section:nth-child(5) { border-top: 3px solid var(--green); }
+    .card { padding: 15px; border-top: 3px solid var(--accent); } .card.kpi-cyan { border-top-color: var(--accent); } .card.kpi-violet { border-top-color: var(--violet); } .card.kpi-amber { border-top-color: var(--amber); } .card.kpi-danger { border-top-color: var(--danger); } .card.kpi-green { border-top-color: var(--green); } .label { color: var(--muted); font-size: 12px; } .value { color: var(--text); font-size: 26px; font-weight: 700; margin-top: 8px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; } section { overflow: hidden; }
+    section.wide { grid-column: 1 / -1; } .section-head { display: flex; justify-content: space-between; padding: 15px 16px; border-bottom: 1px solid var(--line); }
+    .table-wrap { overflow: auto; max-height: 350px; } table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; } th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+    td.wrap { white-space: normal; min-width: 240px; } .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: var(--accent-soft); color: var(--accent-text); font-size: 11px; }
+    .danger { color: var(--danger); } .empty { color: var(--muted); padding: 20px 12px; } .transcript { padding: 12px 16px; }
+    .turn { padding: 9px 11px; border-radius: 8px; margin-bottom: 8px; background: var(--panel-soft); } .turn.user { background: var(--accent-soft); }
+    @media (max-width: 1000px) { .kpis { grid-template-columns: repeat(3, 1fr); } .grid { grid-template-columns: 1fr; } section.wide { grid-column: auto; } }
+    @media (max-width: 560px) { main { width: calc(100% - 20px); } .kpis { grid-template-columns: repeat(2, 1fr); } header { align-items: start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><div><h1>Operations Control Room</h1><p class="muted">Pine Grove · caller, maintenance, escalation, and quality view</p></div><button onclick="loadAll()">Refresh data</button></header>
+  <div class="kpis" id="kpis"></div>
+  <div class="grid">
+    <section><div class="section-head"><h2>Caller profiles</h2><span class="muted">latest 100</span></div><div class="table-wrap"><table id="callers"><thead><tr><th>Phone</th><th>Name</th><th>Unit</th><th>Status</th></tr></thead><tbody></tbody></table></div></section>
+    <section><div class="section-head"><h2>Work orders</h2><span class="muted">latest 100</span></div><div class="table-wrap"><table id="work-orders"><thead><tr><th>Priority</th><th>Incident</th><th>Description</th><th>Status</th></tr></thead><tbody></tbody></table></div></section>
+    <section class="wide"><div class="section-head"><h2>Recent calls & transcripts</h2><span class="muted">select a call to inspect</span></div><div class="table-wrap"><table id="calls"><thead><tr><th>Started</th><th>Caller</th><th>Unit</th><th>State</th><th></th></tr></thead><tbody></tbody></table></div><div class="transcript" id="transcript"><div class="empty">Choose a call to view its transcript.</div></div></section>
+    <section><div class="section-head"><h2>Escalations & failures</h2><span class="muted">workflow events</span></div><div class="table-wrap"><table id="events"><thead><tr><th>Type</th><th>Detail</th><th>Time</th></tr></thead><tbody></tbody></table></div></section>
+    <section><div class="section-head"><h2>Correction history</h2><span class="muted">profile changes</span></div><div class="table-wrap"><table id="history"><thead><tr><th>Field</th><th>Change</th><th>Source</th></tr></thead><tbody></tbody></table></div></section>
+  </div>
+</main>
+<script>
+  const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const time = (v) => v ? new Date(v).toLocaleString() : "";
+  const empty = (body, text = "No data yet") => body.innerHTML = `<tr><td colspan="8" class="empty">${text}</td></tr>`;
+  async function get(path) { const r = await fetch(path); if (!r.ok) throw new Error(`${r.status} ${path}`); return r.json(); }
+  function renderRows(id, rows, html) { const body = document.querySelector(`#${id} tbody`); body.innerHTML = rows.length ? rows.map(html).join("") : `<tr><td colspan="8" class="empty">No data yet</td></tr>`; }
+  async function showTranscript(id) {
+    const box = document.querySelector("#transcript"); box.innerHTML = "Loading…";
+    const rows = await get(`/api/v1/operations/transcripts/${id}`);
+    box.innerHTML = rows.length ? rows.map(r => `<div class="turn ${esc(r.speaker)}"><b>${esc(r.speaker)}</b> · ${esc(time(r.created_at))}<br>${esc(r.text)}</div>`).join("") : `<div class="empty">No transcript turns recorded.</div>`;
+  }
+  async function loadAll() {
+    try {
+      const [summary, callers, orders, calls, events, history] = await Promise.all([
+        get("/api/v1/operations/summary"), get("/api/v1/operations/callers"), get("/api/v1/operations/work-orders"), get("/api/v1/operations/conversations"), get("/api/v1/operations/events"), get("/api/v1/operations/profile-history")
+      ]);
+      const kpis = [["Callers", summary.callers, "kpi-cyan"], ["Unverified", summary.unverified_callers, "kpi-amber"], ["Calls", summary.calls, "kpi-violet"], ["Open work orders", summary.open_work_orders, "kpi-amber"], ["Emergency escalations", summary.emergency_escalations, "kpi-danger"], ["Failures", summary.failures, "kpi-danger"], ["Profile corrections", summary.profile_corrections, "kpi-green"]];
+      document.querySelector("#kpis").innerHTML = kpis.map(([label, value, tone]) => `<div class="card ${tone}"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
+      renderRows("callers", callers, r => `<tr><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.unit)}</td><td><span class="pill">${esc(r.identity_status)}</span></td></tr>`);
+      renderRows("work-orders", orders, r => `<tr><td class="${r.priority === "emergency" ? "danger" : ""}">${esc(r.priority)}</td><td>${esc(r.incident_type)}</td><td class="wrap">${esc(r.description)}</td><td><span class="pill">${esc(r.status)}</span></td></tr>`);
+      renderRows("calls", calls, r => `<tr><td>${esc(time(r.created_at))}</td><td>${esc(r.name || r.phone)}</td><td>${esc(r.unit)}</td><td>${esc(r.state)}</td><td><button onclick="showTranscript('${esc(r.id)}')">View</button></td></tr>`);
+      renderRows("events", events, r => `<tr><td class="${r.event_type.includes("failed") || r.event_type === "transfer_requested" ? "danger" : ""}">${esc(r.event_type)}</td><td class="wrap">${esc(r.detail)}</td><td>${esc(time(r.created_at))}</td></tr>`);
+      renderRows("history", history, r => `<tr><td>${esc(r.field)}</td><td>${esc(r.old_value)} → ${esc(r.new_value)}</td><td>${esc(r.source)}</td></tr>`);
+    } catch (e) { document.querySelector("#kpis").innerHTML = `<div class="card danger">Dashboard error: ${esc(e.message)}</div>`; }
+  }
+  loadAll();
+</script>
+</body>
+</html>

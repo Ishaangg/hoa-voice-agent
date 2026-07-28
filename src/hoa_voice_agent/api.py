@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hoa_voice_agent.adapters.fake import (
@@ -30,7 +31,19 @@ from hoa_voice_agent.config import Settings, get_settings
 from hoa_voice_agent.domain.models import WorkOrder
 from hoa_voice_agent.persistence import tables as _tables  # noqa: F401
 from hoa_voice_agent.persistence.database import Database
-from hoa_voice_agent.persistence.repository import WorkOrderRepository
+from hoa_voice_agent.persistence.repository import (
+    ConversationTurnRepository,
+    WorkflowEventRepository,
+    WorkOrderRepository,
+)
+from hoa_voice_agent.persistence.seed import seed_demo_community_knowledge
+from hoa_voice_agent.persistence.tables import (
+    CallerProfileHistoryRecord,
+    CallerProfileRecord,
+    ConversationRecord,
+    WorkflowEventRecord,
+    WorkOrderRecord,
+)
 from hoa_voice_agent.services.conversation import (
     CommunityNotFoundError,
     ConversationNotFoundError,
@@ -91,6 +104,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             app.state.messaging = FakeMessagingAdapter()
         await database.create_schema()
+        async with database.session_factory() as seed_session:
+            await seed_demo_community_knowledge(seed_session)
         try:
             yield
         finally:
@@ -105,6 +120,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     demo_path = Path(__file__).parent / "static" / "demo.html"
+    operations_path = Path(__file__).parent / "static" / "operations.html"
 
     async def get_session(request: Request):
         async for session in request.app.state.database.sessions():
@@ -149,6 +165,154 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def demo() -> FileResponse:
         return FileResponse(demo_path)
 
+    @app.get("/operations", include_in_schema=False)
+    async def operations_dashboard() -> FileResponse:
+        return FileResponse(operations_path)
+
+    @app.get("/api/v1/operations/summary")
+    async def operations_summary(
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict[str, int]:
+        async def count(model, *conditions) -> int:
+            query = select(func.count()).select_from(model)
+            if conditions:
+                query = query.where(*conditions)
+            return int(await session.scalar(query) or 0)
+
+        return {
+            "callers": await count(CallerProfileRecord),
+            "unverified_callers": await count(
+                CallerProfileRecord,
+                CallerProfileRecord.identity_status == "unverified",
+            ),
+            "calls": await count(ConversationRecord),
+            "open_work_orders": await count(WorkOrderRecord, WorkOrderRecord.status == "open"),
+            "emergency_escalations": await count(
+                WorkflowEventRecord,
+                WorkflowEventRecord.event_type == "transfer_requested",
+            ),
+            "failures": await count(
+                WorkflowEventRecord,
+                WorkflowEventRecord.event_type.endswith("_failed"),
+            ),
+            "profile_corrections": await count(CallerProfileHistoryRecord),
+        }
+
+    @app.get("/api/v1/operations/callers")
+    async def operations_callers(
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(CallerProfileRecord).order_by(CallerProfileRecord.created_at.desc()).limit(100)
+        )
+        return [
+            {
+                "id": str(row.id),
+                "phone": row.caller_phone,
+                "name": row.claimed_name,
+                "unit": row.claimed_unit,
+                "identity_status": row.identity_status,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    @app.get("/api/v1/operations/conversations")
+    async def operations_conversations(
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(ConversationRecord)
+            .order_by(ConversationRecord.created_at.desc())
+            .limit(100)
+        )
+        return [
+            {
+                "id": str(row.id),
+                "phone": row.caller_phone,
+                "name": row.caller_name,
+                "unit": row.caller_unit,
+                "state": row.state,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    @app.get("/api/v1/operations/work-orders")
+    async def operations_work_orders(
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(WorkOrderRecord).order_by(WorkOrderRecord.created_at.desc()).limit(100)
+        )
+        return [
+            {
+                "id": str(row.id),
+                "conversation_id": str(row.conversation_id),
+                "incident_type": row.incident_type,
+                "priority": row.priority,
+                "description": row.description,
+                "status": row.status,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    @app.get("/api/v1/operations/events")
+    async def operations_events(
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await WorkflowEventRepository(session).list_recent()
+        return [
+            {
+                "id": str(row.id),
+                "conversation_id": str(row.conversation_id),
+                "event_type": row.event_type,
+                "detail": row.detail,
+                "reference_id": str(row.reference_id) if row.reference_id else None,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    @app.get("/api/v1/operations/transcripts/{conversation_id}")
+    async def operations_transcript(
+        conversation_id: UUID,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await ConversationTurnRepository(session).list_for_conversation(conversation_id)
+        return [
+            {
+                "id": str(row.id),
+                "speaker": row.speaker,
+                "text": row.text,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
+    @app.get("/api/v1/operations/profile-history")
+    async def operations_profile_history(
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(CallerProfileHistoryRecord)
+            .order_by(CallerProfileHistoryRecord.created_at.desc())
+            .limit(100)
+        )
+        return [
+            {
+                "id": str(row.id),
+                "caller_profile_id": str(row.caller_profile_id),
+                "field": row.field_name,
+                "old_value": row.old_value,
+                "new_value": row.new_value,
+                "source": row.change_source,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+
     @app.post(
         "/api/v1/conversations",
         response_model=StartConversationResponse,
@@ -173,7 +337,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service: Annotated[ConversationService, Depends(get_service)],
     ) -> ConversationTurnResponse:
         try:
-            return await service.handle_turn(conversation_id, body.text)
+            response = await service.handle_turn(conversation_id, body.text)
+            await service.record_assistant_turn(conversation_id, response.say)
+            return response
         except ConversationNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Conversation not found") from exc
         except CommunityNotFoundError as exc:

@@ -37,6 +37,10 @@ class HOAWorkflowProcessor(FrameProcessor):
             route = await self._service.route_voice_turn(self._conversation_id, user_text)
             if route.response:
                 frame.context.add_message({"role": "assistant", "content": route.response.say})
+                await self._service.record_assistant_turn(
+                    self._conversation_id,
+                    route.response.say,
+                )
                 await self._set_support_voice()
                 await self.push_frame(TTSSpeakFrame(route.response.say), FrameDirection.DOWNSTREAM)
                 return

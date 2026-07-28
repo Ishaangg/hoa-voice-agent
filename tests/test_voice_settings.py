@@ -9,6 +9,17 @@ def test_hosted_nvidia_endpoints_require_an_api_key() -> None:
         VoiceRuntimeSettings(nvidia_api_key=None)
 
 
+def test_local_whisper_does_not_require_an_nvidia_api_key() -> None:
+    settings = VoiceRuntimeSettings(
+        voice_stt_provider="local_whisper",
+        nvidia_api_key=None,
+        nvidia_stt_server="localhost:50051",
+        nvidia_tts_server="localhost:50051",
+    )
+
+    assert settings.voice_stt_provider == "local_whisper"
+
+
 def test_self_hosted_nvidia_endpoints_do_not_require_an_api_key() -> None:
     settings = VoiceRuntimeSettings(
         nvidia_api_key=None,
