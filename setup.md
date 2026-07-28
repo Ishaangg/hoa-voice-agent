@@ -15,7 +15,8 @@ connects a Twilio phone number so people can call it.
 ## Prerequisites
 
 - Python 3.12 or 3.13.
-- A NVIDIA API key for the hosted TTS and LLM services.
+- A NVIDIA API key for the hosted LLM service.
+- A Cartesia API key for streaming voice output.
 - Optional: a Twilio account and Voice-capable phone number for real calls.
 - Optional: [ngrok](https://ngrok.com/) or another public HTTPS/WSS tunnel for local Twilio testing.
 
@@ -50,15 +51,32 @@ Minimum browser-voice configuration:
 ```env
 DATABASE_URL=sqlite+aiosqlite:///./hoa_voice_agent.db
 NVIDIA_API_KEY=replace-with-your-key
-VOICE_STT_PROVIDER=local_whisper
-WHISPER_MODEL=base
-WHISPER_COMPUTE_TYPE=int8
-NVIDIA_TTS_VOICE=Magpie-Multilingual.EN-US.Aria.Neutral
-NVIDIA_TTS_GREETING_VOICE=Magpie-Multilingual.EN-US.Aria.Neutral
+VOICE_STT_PROVIDER=deepgram
+DEEPGRAM_API_KEY=replace-with-your-key
+DEEPGRAM_STT_MODEL=nova-3
+# Use `multi` for Hindi-English callers; set `hi` for a Hindi-only line.
+DEEPGRAM_STT_LANGUAGE=multi
+CARTESIA_API_KEY=replace-with-your-key
+CARTESIA_TTS_MODEL=sonic-3.5
+CARTESIA_TTS_ENGLISH_VOICE=9626c31c-bec5-4cca-baa8-f8ba9e84c8bc
+# Arushi is a professional Hinglish voice from Cartesia's voice library.
+CARTESIA_TTS_HINDI_VOICE=95d51f79-c397-46f9-b49a-23763d3eaa2d
+CARTESIA_TTS_SPEED=1.0
+CARTESIA_TTS_EMOTION=calm
+# Choose the spoken language before starting a voice session. It remains fixed
+# throughout the call; a transcript can never change the TTS voice.
+VOICE_DEFAULT_LANGUAGE=en
+VOICE_TURN_STOP_SECS=0.45
+VOICE_LLM_MAX_TOKENS=32
 ```
 
-`local_whisper` avoids NVIDIA hosted ASR. The first run downloads the selected Whisper model.
-NVIDIA TTS and the LLM still require `NVIDIA_API_KEY` unless you configure self-hosted endpoints.
+Deepgram provides the real-time speech-to-text service, so voice recognition does not use your
+local GPU, CUDA, or a downloaded Whisper model. Cartesia provides the streaming speech output;
+the LLM still requires `NVIDIA_API_KEY` unless you configure a different LLM provider.
+
+To start a Hindi call, set `VOICE_DEFAULT_LANGUAGE=hi` and restart the voice runtime before
+the caller connects. To return to English, set it back to `en` before the next session. The
+language is intentionally fixed for a live call to keep voice output stable.
 
 Never commit `.env`. It contains API and Twilio credentials.
 

@@ -31,3 +31,9 @@ async def test_extracts_lift_entrapment() -> None:
     report = await RuleBasedIncidentExtractor().extract("I am trapped in the lift.")
 
     assert report.incident_type == IncidentType.ELEVATOR_ENTRAPMENT
+
+
+async def test_extracts_hindi_fire_report() -> None:
+    report = await RuleBasedIncidentExtractor().extract("लॉबी में आग और धुआं है")
+
+    assert report.incident_type == IncidentType.FIRE_OR_SMOKE

@@ -94,8 +94,8 @@ ruff check .
 ## Run browser WebRTC voice
 
 The workflow demo uses a temporary browser speech-recognition API. The real audio path is
-the separate Pipecat process below. It streams browser microphone audio through NVIDIA
-Nemotron ASR and Magpie TTS, while keeping the deterministic HOA controller in the middle.
+the separate Pipecat process below. It streams browser microphone audio through Deepgram
+Nova-3 STT and Cartesia Sonic 3.5 TTS, while keeping the deterministic HOA controller in the middle.
 It uses VAD plus a short silence timeout to finish each resident turn reliably.
 
 Set `NVIDIA_API_KEY` in `.env` for NVIDIA's hosted services, then install and run:
@@ -105,20 +105,23 @@ python -m pip install -e ".[voice]"
 python -m hoa_voice_agent.voice.bot -t webrtc
 ```
 
-If NVIDIA's hosted ASR is unavailable, use a local Whisper fallback instead:
+Configure Deepgram as the real-time STT provider:
 
 ```env
-VOICE_STT_PROVIDER=local_whisper
-WHISPER_MODEL=base
-WHISPER_COMPUTE_TYPE=int8
+VOICE_STT_PROVIDER=deepgram
+DEEPGRAM_API_KEY=replace-with-your-key
+DEEPGRAM_STT_MODEL=nova-3
+# `multi` supports Hindi-English code switching; use `hi` for Hindi-only calls.
+DEEPGRAM_STT_LANGUAGE=multi
 ```
 
-The first startup downloads the selected Whisper model. NVIDIA TTS and LLM remain hosted.
+Deepgram performs streaming STT remotely, so the agent does not use local Whisper or your GPU.
+Cartesia provides the streaming TTS output; the NVIDIA LLM remains hosted.
 
 Open <http://localhost:7860/client> and allow its microphone prompt. This process starts
 its own local WebRTC development runner; it uses the same database and Fake Community data
-as the FastAPI API. For local NIMs, set `NVIDIA_STT_SERVER` and `NVIDIA_TTS_SERVER` to the
-appropriate gRPC endpoints and omit `NVIDIA_API_KEY`.
+as the FastAPI API. The voice path needs `DEEPGRAM_API_KEY`, `CARTESIA_API_KEY`, and the
+configured NVIDIA LLM key.
 
 ## Receive real calls through a Twilio number
 
@@ -159,9 +162,9 @@ handoff until we implement the Twilio transfer adapter.
 The resulting cascade is:
 
 ```text
-Browser microphone → Pipecat SmallWebRTC → Nemotron streaming ASR
+Browser microphone → Pipecat SmallWebRTC → Deepgram Nova-3 streaming STT
                    → Smart Turn + Nemotron Nano fact extraction
-                   → deterministic HOA policy → Magpie TTS
+                   → deterministic HOA policy → Cartesia Sonic 3.5 TTS
                    → Browser speaker
 ```
 

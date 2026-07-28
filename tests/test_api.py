@@ -110,7 +110,7 @@ async def test_caller_can_correct_a_claimed_unit_after_intake(client: httpx.Asyn
 
     confirmation = await client.post(
         f"/api/v1/conversations/{conversation_id}/turns",
-        json={"text": "Yes"},
+        json={"text": "Yes."},
     )
     assert "updated your unit to Unit 304" in confirmation.json()["say"]
 

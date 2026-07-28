@@ -72,6 +72,18 @@ class ConversationService:
         "locked out",
         "won't open",
         "does not work",
+        "आग",
+        "धुआं",
+        "धुआँ",
+        "गैस",
+        "लीक",
+        "पानी",
+        "बाढ़",
+        "बाढ़",
+        "लिफ्ट",
+        "फंसा",
+        "फँसा",
+        "मरम्मत",
     }
     _stop_words = {
         "a",
@@ -117,7 +129,13 @@ class ConversationService:
         self.conversation_responder = conversation_responder
         self.policy = EmergencyPolicyEngine()
 
-    async def start(self, caller_phone: str, community_id: UUID) -> StartConversationResponse:
+    async def start(
+        self,
+        caller_phone: str,
+        community_id: UUID,
+        *,
+        language: str = "en",
+    ) -> StartConversationResponse:
         community = await self.community_management.get_community(community_id)
         if community is None:
             raise CommunityNotFoundError
@@ -142,20 +160,37 @@ class ConversationService:
                 else ConversationState.AWAITING_RESIDENT_DETAILS
             ),
         )
-        greeting = (
-            f"Hi {resident.first_name}, thank you for calling {community.name}. "
-            "How can I help?"
-            if resident
-            else (
-                f"Welcome back, {caller_profile.claimed_name} in {caller_profile.claimed_unit}. "
-                "How can I help?"
-                if has_claimed_context
+        if language == "hi":
+            greeting = (
+                f"नमस्ते {resident.first_name}, {community.name} को कॉल करने के लिए धन्यवाद। "
+                "मैं आपकी कैसे मदद कर सकती हूँ?"
+                if resident
                 else (
-                    f"Thank you for calling {community.name}. Before I help, please tell me "
-                    "your name and unit number."
+                    f"वापस स्वागत है, {caller_profile.claimed_name}, यूनिट "
+                    f"{caller_profile.claimed_unit}। मैं आपकी कैसे मदद कर सकती हूँ?"
+                    if has_claimed_context
+                    else (
+                        f"{community.name} को कॉल करने के लिए धन्यवाद। सहायता करने से पहले, "
+                        "कृपया अपना नाम और यूनिट नंबर बताएं।"
+                    )
                 )
             )
-        )
+        else:
+            greeting = (
+                f"Hi {resident.first_name}, thank you for calling {community.name}. "
+                "How can I help?"
+                if resident
+                else (
+                    f"Welcome back, {caller_profile.claimed_name} in "
+                    f"{caller_profile.claimed_unit}. "
+                    "How can I help?"
+                    if has_claimed_context
+                    else (
+                        f"Thank you for calling {community.name}. Before I help, please tell me "
+                        "your name and unit number."
+                    )
+                )
+            )
         await self.turns.add(conversation.id, "assistant", greeting)
         return StartConversationResponse(
             conversation_id=conversation.id,
@@ -218,7 +253,13 @@ class ConversationService:
             ),
         )
 
-    async def route_voice_turn(self, conversation_id: UUID, text: str) -> VoiceTurnRoute:
+    async def route_voice_turn(
+        self,
+        conversation_id: UUID,
+        text: str,
+        *,
+        language: str = "en",
+    ) -> VoiceTurnRoute:
         """Keep safety actions local; stream every ordinary turn through the LLM."""
 
         conversation, community = await self._load_conversation_context(conversation_id)
@@ -236,10 +277,14 @@ class ConversationService:
             return VoiceTurnRoute(response=profile_update_response)
         if self._looks_like_maintenance(normalized):
             return VoiceTurnRoute(
-                response=await self._handle_maintenance(conversation, community, text)
+                response=await self._handle_maintenance(
+                    conversation, community, text, language=language
+                )
             )
         faqs = await self.community_knowledge.active_facts(community.community_id)
-        return VoiceTurnRoute(system_prompt=self._voice_system_prompt(community.name, faqs))
+        return VoiceTurnRoute(
+            system_prompt=self._voice_system_prompt(community.name, faqs, language=language)
+        )
 
     async def _load_conversation_context(self, conversation_id: UUID):
         conversation = await self.conversations.get(conversation_id)
@@ -296,9 +341,18 @@ class ConversationService:
         conversation,
         text: str,
     ) -> ConversationTurnResponse | None:
-        normalized = " ".join(text.lower().split())
         if conversation.pending_caller_name or conversation.pending_caller_unit:
-            if normalized in {"yes", "yes please", "confirm", "correct"}:
+            confirmation = self._normalized_confirmation(text)
+            if confirmation in {
+                "yes",
+                "yes please",
+                "yeah",
+                "yep",
+                "confirm",
+                "correct",
+                "that is correct",
+                "please do",
+            }:
                 pending_name = conversation.pending_caller_name
                 pending_unit = conversation.pending_caller_unit
                 updated = await self.conversations.set_caller_details(
@@ -327,7 +381,7 @@ class ConversationService:
                     intent=Intent.CONVERSATION,
                     say=f"I've updated {' and '.join(changes)}. How can I help today?",
                 )
-            if normalized in {"no", "no thanks", "cancel", "never mind"}:
+            if confirmation in {"no", "no thanks", "nope", "cancel", "never mind"}:
                 await self.conversations.clear_pending_caller_update(conversation)
                 return ConversationTurnResponse(
                     conversation_id=conversation.id,
@@ -360,6 +414,8 @@ class ConversationService:
         conversation,
         community,
         text: str,
+        *,
+        language: str = "en",
     ) -> ConversationTurnResponse:
         report = await self.extractor.extract(text)
         decision = self.policy.decide(report)
@@ -453,15 +509,25 @@ class ConversationService:
                 work_order.id,
             )
 
-        spoken_parts = list(decision.instructions)
+        spoken_parts = self._localized_safety_instructions(decision.instructions, language)
         if sms_sent:
-            spoken_parts.append("I created a work order and sent a confirmation by text.")
+            spoken_parts.append(
+                "मैंने कार्य अनुरोध बनाया है और पुष्टि संदेश भेज दिया है।"
+                if language == "hi"
+                else "I created a work order and sent a confirmation by text."
+            )
         else:
             spoken_parts.append(
-                "I created a work order, but I could not send the confirmation text."
+                "मैंने कार्य अनुरोध बनाया है, लेकिन पुष्टि संदेश नहीं भेज सकी।"
+                if language == "hi"
+                else "I created a work order, but I could not send the confirmation text."
             )
         if decision.transfer_to_on_call:
-            spoken_parts.append("I am connecting you to the on-call manager now.")
+            spoken_parts.append(
+                "मैं अब आपको ऑन-कॉल मैनेजर से जोड़ रही हूँ।"
+                if language == "hi"
+                else "I am connecting you to the on-call manager now."
+            )
 
         return ConversationTurnResponse(
             conversation_id=conversation.id,
@@ -493,6 +559,17 @@ class ConversationService:
                 "flood",
                 "water",
                 "leak",
+                "आग",
+                "धुआं",
+                "धुआँ",
+                "गैस",
+                "लीक",
+                "पानी",
+                "बाढ़",
+                "बाढ़",
+                "लिफ्ट",
+                "फंसा",
+                "फँसा",
             )
         )
 
@@ -602,8 +679,25 @@ class ConversationService:
         return value.strip(" .,-")
 
     @staticmethod
-    def _voice_system_prompt(community_name: str, faqs: dict[str, str]) -> str:
+    def _normalized_confirmation(text: str) -> str:
+        """Normalize STT punctuation without weakening the confirmation requirement."""
+
+        return " ".join(re.findall(r"[a-z]+", text.lower()))
+
+    @staticmethod
+    def _voice_system_prompt(
+        community_name: str,
+        faqs: dict[str, str],
+        *,
+        language: str = "en",
+    ) -> str:
         approved_facts = "\n".join(f"- {question}: {answer}" for question, answer in faqs.items())
+        language_instruction = (
+            "Reply in natural Hindi using Devanagari script. Translate approved facts faithfully; "
+            "do not add information."
+            if language == "hi"
+            else "Reply in clear English."
+        )
         return (
             f"You are the friendly voice concierge for {community_name}. "
             "Sound warm, calm, professional, and matter-of-fact; never flirtatious, intimate, "
@@ -615,8 +709,42 @@ class ConversationService:
             f"{approved_facts or '- No approved facts are available.'}\n"
             "Do not invent policies, hours, fees, phone numbers, or work-order status. "
             "If the information is unavailable, say you can help with a community question "
-            "or a maintenance report. Do not give emergency instructions or promise dispatch."
+            "or a maintenance report. Do not give emergency instructions or promise dispatch. "
+            f"{language_instruction}"
         )
+
+    @staticmethod
+    def _localized_safety_instructions(instructions: list[str], language: str) -> list[str]:
+        if language != "hi":
+            return list(instructions)
+        translations = {
+            "Leave the building if it is safe to do so.": (
+                "अगर सुरक्षित हो, तो इमारत से बाहर निकल जाएँ।"
+            ),
+            "Call 911 from a safe location.": "सुरक्षित स्थान से 911 पर कॉल करें।",
+            "Leave the area without operating switches or appliances.": (
+                "स्विच या उपकरण चलाए बिना उस जगह से दूर हो जाएँ।"
+            ),
+            "Call 911 or the gas utility from a safe location.": (
+                "सुरक्षित स्थान से 911 या गैस कंपनी को कॉल करें।"
+            ),
+            "Stay in the elevator and use its emergency call button.": (
+                "लिफ्ट में रहें और उसका आपातकालीन कॉल बटन दबाएँ।"
+            ),
+            "Call 911 if anyone needs immediate medical help.": (
+                "किसी को तुरंत चिकित्सीय मदद चाहिए तो 911 पर कॉल करें।"
+            ),
+            "Avoid standing water near electrical outlets or equipment.": (
+                "बिजली के सॉकेट या उपकरणों के पास खड़े पानी से दूर रहें।"
+            ),
+            "If it is safe, move belongings away from the water.": (
+                "अगर सुरक्षित हो, तो अपना सामान पानी से दूर कर दें।"
+            ),
+            "Stay in a safe, well-lit location while help is arranged.": (
+                "मदद आने तक सुरक्षित और अच्छी रोशनी वाली जगह पर रहें।"
+            ),
+        }
+        return [translations.get(instruction, instruction) for instruction in instructions]
 
     @staticmethod
     def _build_confirmation_sms(

@@ -9,15 +9,33 @@ def test_hosted_nvidia_endpoints_require_an_api_key() -> None:
         VoiceRuntimeSettings(nvidia_api_key=None)
 
 
-def test_local_whisper_does_not_require_an_nvidia_api_key() -> None:
+def test_deepgram_requires_its_own_api_key() -> None:
+    with pytest.raises(ValidationError, match="DEEPGRAM_API_KEY"):
+        VoiceRuntimeSettings(
+            voice_stt_provider="deepgram",
+            deepgram_api_key=None,
+            nvidia_api_key="test-key",
+        )
+
+
+def test_deepgram_does_not_require_an_nvidia_stt_key() -> None:
     settings = VoiceRuntimeSettings(
-        voice_stt_provider="local_whisper",
-        nvidia_api_key=None,
-        nvidia_stt_server="localhost:50051",
-        nvidia_tts_server="localhost:50051",
+        voice_stt_provider="deepgram",
+        deepgram_api_key="deepgram-test-key",
+        nvidia_api_key="test-key",
     )
 
-    assert settings.voice_stt_provider == "local_whisper"
+    assert settings.voice_stt_provider == "deepgram"
+
+
+def test_deepgram_defaults_to_multilingual_nova_three() -> None:
+    settings = VoiceRuntimeSettings(
+        deepgram_api_key="deepgram-test-key",
+        nvidia_api_key="test-key",
+    )
+
+    assert settings.deepgram_stt_model == "nova-3"
+    assert settings.deepgram_stt_language == "multi"
 
 
 def test_self_hosted_nvidia_endpoints_do_not_require_an_api_key() -> None:
@@ -41,15 +59,21 @@ def test_fast_voice_defaults_limit_turn_and_response_delay() -> None:
     settings = VoiceRuntimeSettings(nvidia_api_key="test-key")
 
     assert settings.voice_vad_stop_secs == 0.15
-    assert settings.voice_turn_stop_secs == 0.6
-    assert settings.voice_llm_max_tokens == 48
+    assert settings.voice_turn_stop_secs == 0.45
+    assert settings.voice_llm_max_tokens == 32
 
 
-def test_default_tts_voice_uses_a_neutral_professional_style() -> None:
-    settings = VoiceRuntimeSettings(nvidia_api_key="test-key")
+def test_default_cartesia_voice_uses_a_calm_professional_style() -> None:
+    settings = VoiceRuntimeSettings(
+        nvidia_api_key="test-key",
+        voice_default_language="en",
+    )
 
-    assert settings.nvidia_tts_voice == "Magpie-Multilingual.EN-US.Aria.Neutral"
-    assert settings.nvidia_tts_greeting_voice == "Magpie-Multilingual.EN-US.Aria.Neutral"
+    assert settings.cartesia_tts_model == "sonic-3.5"
+    assert settings.cartesia_tts_emotion == "calm"
+    assert settings.cartesia_tts_english_voice
+    assert settings.cartesia_tts_hindi_voice
+    assert settings.voice_default_language == "en"
 
 
 def test_twilio_mode_requires_all_twilio_credentials() -> None:

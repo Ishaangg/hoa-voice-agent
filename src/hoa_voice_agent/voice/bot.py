@@ -7,6 +7,8 @@ The Pipecat development runner then serves a browser client at
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Sequence
 from contextlib import suppress
 
 from fastapi import HTTPException, Request
@@ -14,7 +16,7 @@ from fastapi.responses import Response
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -28,9 +30,10 @@ from pipecat.runner.types import (
     SmallWebRTCRunnerArguments,
     WebSocketRunnerArguments,
 )
+from pipecat.services.cartesia.tts import CartesiaTTSService, GenerationConfig
 from pipecat.services.nvidia.llm import NvidiaLLMService
 from pipecat.services.nvidia.stt import NvidiaSTTService
-from pipecat.services.nvidia.tts import NvidiaTTSService
+from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
@@ -48,6 +51,7 @@ from hoa_voice_agent.persistence.database import Database
 from hoa_voice_agent.persistence.seed import seed_demo_community_knowledge
 from hoa_voice_agent.services.conversation import ConversationService
 from hoa_voice_agent.services.nvidia_incident_extractor import NvidiaIncidentExtractor
+from hoa_voice_agent.voice.language import tts_settings_for_language
 from hoa_voice_agent.voice.settings import VoiceRuntimeSettings
 from hoa_voice_agent.voice.twilio_voice import (
     is_valid_twilio_request,
@@ -70,15 +74,20 @@ def create_stt(settings: VoiceRuntimeSettings):
         )
 
     try:
-        from pipecat.services.whisper.stt import WhisperSTTService
+        from pipecat.services.deepgram.stt import DeepgramSTTService
     except ImportError as exc:
         raise RuntimeError(
-            "Local Whisper is not installed. Run: python -m pip install -e \".[voice]\""
+            "Deepgram support is not installed. Run: python -m pip install -e \".[voice]\""
         ) from exc
-    return WhisperSTTService(
-        settings=WhisperSTTService.Settings(model=settings.whisper_model),
-        device=settings.whisper_device,
-        compute_type=settings.whisper_compute_type,
+    return DeepgramSTTService(
+        api_key=settings.deepgram_api_key,
+        settings=DeepgramSTTService.Settings(
+            model=settings.deepgram_stt_model,
+            language=settings.deepgram_stt_language,
+            interim_results=True,
+            numerals=True,
+            punctuate=True,
+        ),
     )
 
 
@@ -115,23 +124,35 @@ async def run_bot(
                 api_key=settings.nvidia_api_key,
                 base_url=settings.nvidia_llm_base_url,
                 model=settings.nvidia_llm_model,
+                # Known safety phrases are handled locally. This avoids an LLM
+                # round trip before creating an emergency or urgent work order.
+                prefer_local_for_known_incidents=True,
             ),
         )
         conversation = await conversation_service.start(
             caller_phone,
             COMMUNITY_ID,
+            language=settings.voice_default_language,
         )
 
         stt = create_stt(settings)
-        tts = NvidiaTTSService(
-            api_key=settings.nvidia_api_key,
-            server=settings.nvidia_tts_server,
-            use_ssl=settings.use_ssl_for(settings.nvidia_tts_server),
-            model_function_map={
-                "function_id": settings.nvidia_tts_function_id,
-                "model_name": settings.nvidia_tts_model,
-            },
-            settings=NvidiaTTSService.Settings(voice=settings.nvidia_tts_voice),
+        tts_language_settings = tts_settings_for_language(
+            settings.voice_default_language,
+            english_voice=settings.cartesia_tts_english_voice,
+            hindi_voice=settings.cartesia_tts_hindi_voice,
+        )
+        tts = CartesiaTTSService(
+            api_key=settings.cartesia_api_key,
+            settings=CartesiaTTSService.Settings(
+                model=settings.cartesia_tts_model,
+                voice=tts_language_settings["voice"],
+                language=tts_language_settings["language"],
+                generation_config=GenerationConfig(
+                    speed=settings.cartesia_tts_speed,
+                    emotion=settings.cartesia_tts_emotion,
+                ),
+            ),
+            text_aggregation_mode=TextAggregationMode.SENTENCE,
         )
         llm = NvidiaLLMService(
             api_key=settings.nvidia_api_key,
@@ -168,7 +189,7 @@ async def run_bot(
         workflow = HOAWorkflowProcessor(
             conversation_service,
             conversation.conversation_id,
-            settings.nvidia_tts_voice,
+            settings.voice_default_language,
         )
         pipeline = Pipeline(
             [
@@ -204,10 +225,7 @@ async def run_bot(
                 conversation.conversation_id,
             )
             await task.queue_frames(
-                [
-                    TTSUpdateSettingsFrame(settings={"voice": settings.nvidia_tts_greeting_voice}),
-                    TTSSpeakFrame(conversation.say),
-                ]
+                [TTSSpeakFrame(conversation.say)]
             )
 
         @transport.event_handler("on_client_connected")
@@ -341,6 +359,22 @@ def configure_twilio_voice_webhook() -> None:
         )
 
 
+def is_twilio_runner(arguments: Sequence[str]) -> bool:
+    """Return whether this runner process is serving Twilio Media Streams.
+
+    SmallWebRTC and Twilio both use a WebSocket path named ``/ws``. Mounting
+    Twilio's signature middleware for a browser runner would therefore reject
+    every browser WebSocket as an unsigned Twilio request.
+    """
+
+    for index, argument in enumerate(arguments):
+        if argument in {"-t", "--transport"} and index + 1 < len(arguments):
+            return arguments[index + 1] == "twilio"
+        if argument.startswith("--transport="):
+            return argument.removeprefix("--transport=") == "twilio"
+    return False
+
+
 def main() -> None:
     try:
         from pipecat.runner.run import main as runner_main
@@ -352,7 +386,8 @@ def main() -> None:
     # Validate before the browser can connect. This prevents a configuration error
     # from appearing as an apparently successful but silent WebRTC session.
     VoiceRuntimeSettings()
-    configure_twilio_voice_webhook()
+    if is_twilio_runner(sys.argv[1:]):
+        configure_twilio_voice_webhook()
     runner_main()
 
 

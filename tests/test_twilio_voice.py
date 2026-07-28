@@ -2,11 +2,18 @@ import base64
 import hashlib
 import hmac
 
+from hoa_voice_agent.voice.bot import is_twilio_runner
 from hoa_voice_agent.voice.twilio_voice import (
     is_valid_twilio_request,
     is_valid_twilio_websocket_request,
     twiml_for_media_stream,
 )
+
+
+def test_only_twilio_runner_mounts_twilio_websocket_validation() -> None:
+    assert is_twilio_runner(["-t", "twilio"])
+    assert is_twilio_runner(["--transport=twilio"])
+    assert not is_twilio_runner(["-t", "webrtc"])
 
 
 def test_twilio_webhook_signature_is_validated() -> None:

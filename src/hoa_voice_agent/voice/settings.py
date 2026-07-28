@@ -8,29 +8,36 @@ class VoiceRuntimeSettings(BaseSettings):
     """Configuration for the separately-run Pipecat browser voice process."""
 
     database_url: str = "sqlite+aiosqlite:///./hoa_voice_agent.db"
-    voice_stt_provider: Literal["nvidia", "local_whisper"] = "nvidia"
-    whisper_model: str = "base"
-    whisper_device: str = "auto"
-    whisper_compute_type: str = "int8"
+    # Deepgram runs as a managed streaming service, so the caller experience
+    # does not depend on this machine's GPU, CUDA, or local model downloads.
+    voice_stt_provider: Literal["nvidia", "deepgram"] = "deepgram"
+    deepgram_api_key: str | None = None
+    deepgram_stt_model: str = "nova-3"
+    # `multi` reliably covers a resident who moves between Hindi and English
+    # in one call. Deployments serving Hindi-only callers can set this to `hi`.
+    deepgram_stt_language: Literal["hi", "multi"] = "multi"
     nvidia_api_key: str | None = None
     nvidia_stt_server: str = "grpc.nvcf.nvidia.com:443"
     nvidia_tts_server: str = "grpc.nvcf.nvidia.com:443"
     nvidia_stt_function_id: str = "bb0837de-8c7b-481f-9ec8-ef5663e9c1fa"
     nvidia_stt_model: str = "nemotron-asr-streaming"
-    nvidia_tts_function_id: str = "877104f7-e885-42b9-8de8-f6e4c6303969"
-    nvidia_tts_model: str = "magpie-tts-multilingual"
-    # Neutral keeps the resident-support voice warm and professional without
-    # sounding intimate or overly expressive.
-    nvidia_tts_voice: str = "Magpie-Multilingual.EN-US.Aria.Neutral"
-    nvidia_tts_greeting_voice: str = "Magpie-Multilingual.EN-US.Aria.Neutral"
+    voice_default_language: Literal["en", "hi"] = "en"
+    cartesia_api_key: str | None = None
+    cartesia_tts_model: str = "sonic-3.5"
+    # Voice IDs are selected from Cartesia's voice library for a calm,
+    # professional resident-support delivery.
+    cartesia_tts_english_voice: str = "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+    cartesia_tts_hindi_voice: str = "95d51f79-c397-46f9-b49a-23763d3eaa2d"
+    cartesia_tts_speed: float = 1.0
+    cartesia_tts_emotion: str = "calm"
     nvidia_llm_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_llm_model: str = "nvidia/nemotron-3-nano-30b-a3b"
     nvidia_use_ssl: bool | None = None
     voice_demo_caller_phone: str = "+15550101111"
     # Fast defaults for short, single-user calls. Raise turn-stop to 0.8-1.0 in noisy rooms.
     voice_vad_stop_secs: float = 0.15
-    voice_turn_stop_secs: float = 0.6
-    voice_llm_max_tokens: int = 48
+    voice_turn_stop_secs: float = 0.45
+    voice_llm_max_tokens: int = 32
     sms_mode: Literal["fake", "twilio"] = "fake"
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
@@ -59,6 +66,12 @@ class VoiceRuntimeSettings(BaseSettings):
                 "For self-hosted NIM, set NVIDIA_STT_SERVER and NVIDIA_TTS_SERVER "
                 "to local endpoints."
             )
+        if self.voice_stt_provider == "deepgram" and not self.deepgram_api_key:
+            raise ValueError(
+                "DEEPGRAM_API_KEY is required when VOICE_STT_PROVIDER=deepgram."
+            )
+        if not self.cartesia_api_key:
+            raise ValueError("CARTESIA_API_KEY is required for Cartesia voice output.")
         if self.sms_mode == "twilio" and not all(
             (self.twilio_account_sid, self.twilio_auth_token, self.twilio_from_phone)
         ):

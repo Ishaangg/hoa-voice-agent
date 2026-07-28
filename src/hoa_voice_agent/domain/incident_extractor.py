@@ -12,8 +12,8 @@ class RuleBasedIncidentExtractor:
     """Temporary Phase 1 extractor; replace with schema-constrained LLM output."""
 
     _rules: tuple[tuple[IncidentType, tuple[str, ...]], ...] = (
-        (IncidentType.FIRE_OR_SMOKE, ("fire", "smoke", "burning")),
-        (IncidentType.GAS_SMELL, ("gas smell", "smell gas", "natural gas")),
+        (IncidentType.FIRE_OR_SMOKE, ("fire", "smoke", "burning", "आग", "धुआं", "धुआँ")),
+        (IncidentType.GAS_SMELL, ("gas smell", "smell gas", "natural gas", "गैस")),
         (
             IncidentType.ELEVATOR_ENTRAPMENT,
             (
@@ -23,11 +23,23 @@ class RuleBasedIncidentExtractor:
                 "stuck in the lift",
                 "trapped in the lift",
                 "lift trapped",
+                "लिफ्ट में फंसा",
+                "लिफ्ट में फँसा",
             ),
         ),
         (
             IncidentType.ACTIVE_FLOODING,
-            ("flood", "leak", "water coming", "burst pipe", "overflow"),
+            (
+                "flood",
+                "leak",
+                "water coming",
+                "burst pipe",
+                "overflow",
+                "लीक",
+                "पानी",
+                "बाढ़",
+                "बाढ़",
+            ),
         ),
         (
             IncidentType.ACCESS_FAILURE,

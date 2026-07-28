@@ -31,14 +31,20 @@ class NvidiaIncidentExtractor(IncidentExtractor):
         model: str,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
         fallback: IncidentExtractor | None = None,
+        prefer_local_for_known_incidents: bool = False,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._client_factory = client_factory or (lambda: httpx.AsyncClient(timeout=8.0))
         self._fallback = fallback or RuleBasedIncidentExtractor()
+        self._prefer_local_for_known_incidents = prefer_local_for_known_incidents
 
     async def extract(self, description: str) -> IncidentReport:
+        if self._prefer_local_for_known_incidents:
+            local_report = await self._fallback.extract(description)
+            if local_report.incident_type.value != "unknown":
+                return local_report
         try:
             async with self._client_factory() as client:
                 response = await client.post(
