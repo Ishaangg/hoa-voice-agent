@@ -508,14 +508,16 @@ class ConversationService:
         )
         unit_match = re.search(
             r"\b(?:my\s+)?(?:unit(?:\s+number)?|apt(?:artment)?|flat)\s*"
-            r"(?:is|:)?\s*#?\s*([a-z0-9][a-z0-9 -]{0,40})",
+            r"(?:is|:)?\s*(?:(?:uh|um|er|erm)\b[\s,.]*)*"
+            r"#?\s*([a-z0-9][a-z0-9 .-]{0,40})",
             text,
             flags=re.IGNORECASE,
         )
         name = name_match.group(1).strip(" .,-") if name_match else None
         unit = (
-            f"Unit {ConversationService._normalize_spoken_unit(unit_match.group(1))}"
+            f"Unit {normalized_unit}"
             if unit_match
+            and (normalized_unit := ConversationService._normalize_spoken_unit(unit_match.group(1)))
             else None
         )
         return name, unit
@@ -550,6 +552,13 @@ class ConversationService:
                 text,
                 flags=re.IGNORECASE,
             )
+        if not unit_match:
+            unit_match = re.search(
+                r"\b(?:my\s+)?(?:unit\s+number|unit|apartment|apt|flat)\s+"
+                r"(?:is|number\s+is)\s*#?\s*([a-z0-9][a-z0-9 .-]{0,40})",
+                text,
+                flags=re.IGNORECASE,
+            )
         name = next((group for group in name_match.groups() if group), None) if name_match else None
         if name:
             name = name.strip(" .,-")
@@ -558,9 +567,12 @@ class ConversationService:
             if unit_match
             else None
         )
+        normalized_unit = (
+            ConversationService._normalize_spoken_unit(unit_value) if unit_value else None
+        )
         unit = (
-            f"Unit {ConversationService._normalize_spoken_unit(unit_value)}"
-            if unit_value
+            f"Unit {normalized_unit}"
+            if normalized_unit
             else None
         )
         return name, unit
@@ -578,10 +590,15 @@ class ConversationService:
             "seven": "7",
             "eight": "8",
             "nine": "9",
+            "oh": "0",
+            "o": "0",
         }
-        words = value.strip(" .,-").lower().split()
-        if words and all(word in digit_words for word in words):
-            return "".join(digit_words[word] for word in words)
+        words = re.findall(r"[a-z0-9]+", value.lower())
+        words = [word for word in words if word not in {"uh", "um", "er", "erm"}]
+        if not words:
+            return ""
+        if all(word in digit_words or word.isdigit() for word in words):
+            return "".join(digit_words.get(word, word) for word in words)
         return value.strip(" .,-")
 
     @staticmethod
@@ -589,6 +606,8 @@ class ConversationService:
         approved_facts = "\n".join(f"- {question}: {answer}" for question, answer in faqs.items())
         return (
             f"You are the friendly voice concierge for {community_name}. "
+            "Sound warm, calm, professional, and matter-of-fact; never flirtatious, intimate, "
+            "seductive, or overly theatrical. "
             "Give the direct answer in the first sentence, ending it within 12 words. "
             "Use a second short sentence only when it materially helps. "
             "You may greet the resident and help with general conversation. For HOA facts, "

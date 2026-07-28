@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from contextlib import suppress
 
+from fastapi import HTTPException, Request
+from fastapi.responses import Response
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -21,7 +23,11 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.runner.types import (
+    RunnerArguments,
+    SmallWebRTCRunnerArguments,
+    WebSocketRunnerArguments,
+)
 from pipecat.services.nvidia.llm import NvidiaLLMService
 from pipecat.services.nvidia.stt import NvidiaSTTService
 from pipecat.services.nvidia.tts import NvidiaTTSService
@@ -43,6 +49,11 @@ from hoa_voice_agent.persistence.seed import seed_demo_community_knowledge
 from hoa_voice_agent.services.conversation import ConversationService
 from hoa_voice_agent.services.nvidia_incident_extractor import NvidiaIncidentExtractor
 from hoa_voice_agent.voice.settings import VoiceRuntimeSettings
+from hoa_voice_agent.voice.twilio_voice import (
+    is_valid_twilio_request,
+    is_valid_twilio_websocket_request,
+    twiml_for_media_stream,
+)
 from hoa_voice_agent.voice.workflow_processor import HOAWorkflowProcessor
 
 
@@ -71,7 +82,13 @@ def create_stt(settings: VoiceRuntimeSettings):
     )
 
 
-async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSettings) -> None:
+async def run_bot(
+    transport,
+    settings: VoiceRuntimeSettings,
+    *,
+    caller_phone: str,
+    greeting_after_rtvi_ready: bool,
+) -> None:
     """Build one isolated resident audio session."""
 
     database = Database(settings.database_url)
@@ -101,7 +118,7 @@ async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSetting
             ),
         )
         conversation = await conversation_service.start(
-            settings.voice_demo_caller_phone,
+            caller_phone,
             COMMUNITY_ID,
         )
 
@@ -195,14 +212,20 @@ async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSetting
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(_transport, _connection) -> None:
-            logger.info("WebRTC client connected; waiting for RTVI client-ready handshake.")
-
-        @task.rtvi.event_handler("on_client_ready")
-        async def on_client_ready(_rtvi) -> None:
-            # The connection event can arrive before pipeline event handlers are fully
-            # registered. RTVI client-ready occurs only after the browser can receive
-            # bot output, so it is the reliable place to start the spoken session.
+            if greeting_after_rtvi_ready:
+                logger.info("WebRTC client connected; waiting for RTVI client-ready handshake.")
+                return
+            logger.info("Twilio caller connected; starting voice session {}.", task.id)
             await queue_greeting()
+
+        if greeting_after_rtvi_ready:
+
+            @task.rtvi.event_handler("on_client_ready")
+            async def on_client_ready(_rtvi) -> None:
+                # The connection event can arrive before pipeline event handlers are fully
+                # registered. RTVI client-ready occurs only after the browser can receive
+                # bot output, so it is the reliable place to start the spoken session.
+                await queue_greeting()
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(_transport, _connection) -> None:
@@ -216,17 +239,106 @@ async def run_bot(transport: SmallWebRTCTransport, settings: VoiceRuntimeSetting
 
 
 async def bot(runner_args: RunnerArguments) -> None:
-    """Pipecat runner entry point for browser WebRTC sessions."""
-
-    if not isinstance(runner_args, SmallWebRTCRunnerArguments):
-        raise RuntimeError("This HOA voice bot currently supports Pipecat SmallWebRTC only.")
+    """Pipecat runner entry point for browser and Twilio voice sessions."""
 
     settings = VoiceRuntimeSettings()
-    transport = SmallWebRTCTransport(
-        webrtc_connection=runner_args.webrtc_connection,
-        params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
-    )
-    await run_bot(transport, settings)
+    if isinstance(runner_args, SmallWebRTCRunnerArguments):
+        transport = SmallWebRTCTransport(
+            webrtc_connection=runner_args.webrtc_connection,
+            params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+        )
+        await run_bot(
+            transport,
+            settings,
+            caller_phone=settings.voice_demo_caller_phone,
+            greeting_after_rtvi_ready=True,
+        )
+        return
+
+    if isinstance(runner_args, WebSocketRunnerArguments):
+        from pipecat.runner.utils import create_transport
+        from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+
+        transport = await create_transport(
+            runner_args,
+            {
+                "twilio": lambda: FastAPIWebsocketParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                )
+            },
+        )
+        if runner_args.transport_type != "twilio":
+            raise RuntimeError("This HOA phone bot only accepts Twilio Media Streams.")
+        caller_phone = runner_args.call_data.from_number if runner_args.call_data else None
+        if not caller_phone:
+            raise RuntimeError("Twilio Media Stream did not include the caller phone number.")
+        await run_bot(
+            transport,
+            settings,
+            caller_phone=caller_phone,
+            greeting_after_rtvi_ready=False,
+        )
+        return
+
+    raise RuntimeError("This HOA voice bot supports SmallWebRTC and Twilio Media Streams only.")
+
+
+def configure_twilio_voice_webhook() -> None:
+    """Register the signed Twilio webhook before Pipecat starts its FastAPI app."""
+
+    from pipecat.runner.run import app
+
+    class TwilioMediaStreamSignatureMiddleware:
+        """Reject unsigned traffic before Pipecat accepts the phone WebSocket."""
+
+        def __init__(self, next_app) -> None:
+            self._next_app = next_app
+
+        async def __call__(self, scope, receive, send) -> None:
+            if scope["type"] == "websocket" and scope["path"] == "/ws":
+                settings = VoiceRuntimeSettings()
+                if (
+                    settings.twilio_validate_webhooks
+                    and settings.twilio_voice_stream_url
+                    and not is_valid_twilio_websocket_request(
+                        auth_token=settings.twilio_auth_token or "",
+                        stream_url=settings.twilio_voice_stream_url,
+                        signature=dict(scope["headers"]).get(b"x-twilio-signature", b"").decode(),
+                    )
+                ):
+                    await send({"type": "websocket.close", "code": 4403})
+                    return
+            await self._next_app(scope, receive, send)
+
+    app.add_middleware(TwilioMediaStreamSignatureMiddleware)
+
+    @app.post("/twilio/voice")
+    async def incoming_twilio_call(request: Request) -> Response:
+        settings = VoiceRuntimeSettings()
+        if not settings.twilio_voice_webhook_url or not settings.twilio_voice_stream_url:
+            raise HTTPException(status_code=503, detail="Twilio Voice is not configured.")
+
+        raw_body = (await request.body()).decode("utf-8")
+        from urllib.parse import parse_qs
+
+        form_values = {key: values[-1] for key, values in parse_qs(raw_body).items()}
+        if settings.twilio_validate_webhooks and not is_valid_twilio_request(
+            auth_token=settings.twilio_auth_token or "",
+            url=settings.twilio_voice_webhook_url,
+            form_values=form_values,
+            signature=request.headers.get("X-Twilio-Signature"),
+        ):
+            raise HTTPException(status_code=403, detail="Invalid Twilio webhook signature.")
+
+        return Response(
+            content=twiml_for_media_stream(
+                stream_url=settings.twilio_voice_stream_url,
+                from_number=form_values.get("From", ""),
+                to_number=form_values.get("To", ""),
+            ),
+            media_type="application/xml",
+        )
 
 
 def main() -> None:
@@ -240,6 +352,7 @@ def main() -> None:
     # Validate before the browser can connect. This prevents a configuration error
     # from appearing as an apparently successful but silent WebRTC session.
     VoiceRuntimeSettings()
+    configure_twilio_voice_webhook()
     runner_main()
 
 

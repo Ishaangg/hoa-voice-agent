@@ -120,6 +120,42 @@ its own local WebRTC development runner; it uses the same database and Fake Comm
 as the FastAPI API. For local NIMs, set `NVIDIA_STT_SERVER` and `NVIDIA_TTS_SERVER` to the
 appropriate gRPC endpoints and omit `NVIDIA_API_KEY`.
 
+## Receive real calls through a Twilio number
+
+The phone agent uses Twilio's bidirectional Media Streams. The signed inbound-call webhook
+returns TwiML, which opens a secure WebSocket stream to the same Pipecat pipeline used by the
+browser demo. The caller's actual `From` number is passed into the conversation, so a returning
+resident is identified from their own caller profile and a new number creates an unverified one.
+
+For a local demo, create a public HTTPS/WSS tunnel to the Pipecat runner first. For example, if
+the runner listens on `7860`, an ngrok tunnel gives you a public address such as
+`https://example.ngrok.app`:
+
+```env
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your-auth-token
+TWILIO_FROM_PHONE=+1xxxxxxxxxx
+TWILIO_VOICE_WEBHOOK_URL=https://example.ngrok.app/twilio/voice
+TWILIO_VOICE_STREAM_URL=wss://example.ngrok.app/ws
+TWILIO_VALIDATE_WEBHOOKS=true
+```
+
+Start the phone runtime with the Twilio transport:
+
+```powershell
+python -m hoa_voice_agent.voice.bot -t twilio
+```
+
+Then, in the Twilio Console, open the purchased number's **Voice Configuration** and set **A call
+comes in** to `POST https://example.ngrok.app/twilio/voice`. Call that number from a different
+phone. Both the inbound webhook and Media Stream WebSocket handshake signatures are checked before
+the call reaches the agent; do not turn signature checking off outside an isolated test.
+
+Twilio requires the media endpoint to be publicly reachable as `wss://` over port 443. The
+Pipecat serializer converts the 8 kHz mu-law call stream to and from the pipeline audio format.
+The current emergency transfer adapter remains simulated, so do not treat it as a live on-call
+handoff until we implement the Twilio transfer adapter.
+
 The resulting cascade is:
 
 ```text

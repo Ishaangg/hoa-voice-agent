@@ -45,11 +45,11 @@ def test_fast_voice_defaults_limit_turn_and_response_delay() -> None:
     assert settings.voice_llm_max_tokens == 48
 
 
-def test_default_tts_voice_uses_a_calm_emotional_style() -> None:
+def test_default_tts_voice_uses_a_neutral_professional_style() -> None:
     settings = VoiceRuntimeSettings(nvidia_api_key="test-key")
 
-    assert settings.nvidia_tts_voice == "Magpie-Multilingual.EN-US.Aria.Calm"
-    assert settings.nvidia_tts_greeting_voice == "Magpie-Multilingual.EN-US.Aria.Happy"
+    assert settings.nvidia_tts_voice == "Magpie-Multilingual.EN-US.Aria.Neutral"
+    assert settings.nvidia_tts_greeting_voice == "Magpie-Multilingual.EN-US.Aria.Neutral"
 
 
 def test_twilio_mode_requires_all_twilio_credentials() -> None:
@@ -60,4 +60,25 @@ def test_twilio_mode_requires_all_twilio_credentials() -> None:
             twilio_account_sid=None,
             twilio_auth_token=None,
             twilio_from_phone=None,
+        )
+
+
+def test_twilio_voice_urls_must_be_configured_together() -> None:
+    with pytest.raises(ValidationError, match="TWILIO_VOICE_WEBHOOK_URL"):
+        VoiceRuntimeSettings(
+            nvidia_api_key="test-key",
+            twilio_voice_webhook_url="https://example.ngrok.app/twilio/voice",
+            twilio_voice_stream_url=None,
+        )
+
+
+def test_twilio_voice_requires_secure_urls() -> None:
+    with pytest.raises(ValidationError, match="TWILIO_VOICE_STREAM_URL must use wss"):
+        VoiceRuntimeSettings(
+            nvidia_api_key="test-key",
+            twilio_account_sid="AC123",
+            twilio_auth_token="secret",
+            twilio_from_phone="+15550101000",
+            twilio_voice_webhook_url="https://example.ngrok.app/twilio/voice",
+            twilio_voice_stream_url="ws://example.ngrok.app/ws",
         )

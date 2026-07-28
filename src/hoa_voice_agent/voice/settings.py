@@ -19,10 +19,10 @@ class VoiceRuntimeSettings(BaseSettings):
     nvidia_stt_model: str = "nemotron-asr-streaming"
     nvidia_tts_function_id: str = "877104f7-e885-42b9-8de8-f6e4c6303969"
     nvidia_tts_model: str = "magpie-tts-multilingual"
-    # Magpie without an emotion suffix is neutral. Calm is warm without sounding
-    # inappropriate for maintenance incidents or emergency instructions.
-    nvidia_tts_voice: str = "Magpie-Multilingual.EN-US.Aria.Calm"
-    nvidia_tts_greeting_voice: str = "Magpie-Multilingual.EN-US.Aria.Happy"
+    # Neutral keeps the resident-support voice warm and professional without
+    # sounding intimate or overly expressive.
+    nvidia_tts_voice: str = "Magpie-Multilingual.EN-US.Aria.Neutral"
+    nvidia_tts_greeting_voice: str = "Magpie-Multilingual.EN-US.Aria.Neutral"
     nvidia_llm_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_llm_model: str = "nvidia/nemotron-3-nano-30b-a3b"
     nvidia_use_ssl: bool | None = None
@@ -35,6 +35,11 @@ class VoiceRuntimeSettings(BaseSettings):
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
     twilio_from_phone: str | None = None
+    # The exact public HTTPS URL configured on the Twilio phone number, and the
+    # matching secure WebSocket URL that receives the Media Stream.
+    twilio_voice_webhook_url: str | None = None
+    twilio_voice_stream_url: str | None = None
+    twilio_validate_webhooks: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -61,6 +66,21 @@ class VoiceRuntimeSettings(BaseSettings):
                 "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_PHONE are required "
                 "when SMS_MODE=twilio."
             )
+        voice_urls = (self.twilio_voice_webhook_url, self.twilio_voice_stream_url)
+        if any(voice_urls) and not all(voice_urls):
+            raise ValueError(
+                "TWILIO_VOICE_WEBHOOK_URL and TWILIO_VOICE_STREAM_URL must be set together."
+            )
+        if all(voice_urls):
+            if not all((self.twilio_account_sid, self.twilio_auth_token, self.twilio_from_phone)):
+                raise ValueError(
+                    "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_PHONE are required "
+                    "for Twilio Voice."
+                )
+            if not self.twilio_voice_webhook_url.startswith("https://"):
+                raise ValueError("TWILIO_VOICE_WEBHOOK_URL must use https://.")
+            if not self.twilio_voice_stream_url.startswith("wss://"):
+                raise ValueError("TWILIO_VOICE_STREAM_URL must use wss://.")
         return self
 
     def use_ssl_for(self, server: str) -> bool:

@@ -14,7 +14,7 @@
     .muted { color: var(--muted); font-size: 13px; margin-top: 7px; }
     button { border: 1px solid var(--line); background: var(--panel-soft); color: var(--text); border-radius: 7px; padding: 9px 13px; cursor: pointer; }
     button:hover, button.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
-    .kpis { display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .kpis { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }
     .card, section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px #17203314; }
     section:nth-child(1) { border-top: 3px solid var(--accent); }
     section:nth-child(2) { border-top: 3px solid var(--amber); }
@@ -61,7 +61,7 @@
       const [summary, callers, orders, calls, events, history] = await Promise.all([
         get("/api/v1/operations/summary"), get("/api/v1/operations/callers"), get("/api/v1/operations/work-orders"), get("/api/v1/operations/conversations"), get("/api/v1/operations/events"), get("/api/v1/operations/profile-history")
       ]);
-      const kpis = [["Callers", summary.callers, "kpi-cyan"], ["Unverified", summary.unverified_callers, "kpi-amber"], ["Calls", summary.calls, "kpi-violet"], ["Open work orders", summary.open_work_orders, "kpi-amber"], ["Emergency escalations", summary.emergency_escalations, "kpi-danger"], ["Failures", summary.failures, "kpi-danger"], ["Profile corrections", summary.profile_corrections, "kpi-green"]];
+      const kpis = [["Active emergencies", summary.active_emergencies, "kpi-danger"], ["Urgent open work", summary.urgent_open_work_orders, "kpi-danger"], ["Open work orders", summary.open_work_orders, "kpi-amber"], ["Failed operations", summary.failures, "kpi-danger"], ["Calls today", summary.calls_today, "kpi-violet"], ["Awaiting verification", summary.unverified_callers, "kpi-cyan"]];
       document.querySelector("#kpis").innerHTML = kpis.map(([label, value, tone]) => `<div class="card ${tone}"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
       renderRows("callers", callers, r => `<tr><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.unit)}</td><td><span class="pill">${esc(r.identity_status)}</span></td></tr>`);
       renderRows("work-orders", orders, r => `<tr><td class="${r.priority === "emergency" ? "danger" : ""}">${esc(r.priority)}</td><td>${esc(r.incident_type)}</td><td class="wrap">${esc(r.description)}</td><td><span class="pill">${esc(r.status)}</span></td></tr>`);

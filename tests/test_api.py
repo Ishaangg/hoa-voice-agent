@@ -177,6 +177,24 @@ def test_spoken_resident_details_do_not_leak_into_name_or_unit() -> None:
     assert unit == "Unit 737"
 
 
+def test_spoken_unit_fillers_are_ignored() -> None:
+    name, unit = ConversationService._extract_caller_details(
+        "Uh, my name is Ishan and my unit number is uh. three Oh. three."
+    )
+
+    assert name == "Ishan"
+    assert unit == "Unit 303"
+
+
+def test_natural_unit_restatement_is_detected_as_a_correction() -> None:
+    name, unit = ConversationService._extract_profile_correction(
+        "I'm sorry, you missed my unit number is seven. Zero three."
+    )
+
+    assert name is None
+    assert unit == "Unit 703"
+
+
 async def test_faq_turn_returns_community_answer(client: httpx.AsyncClient) -> None:
     conversation_id = await start_conversation(client)
 
@@ -283,7 +301,10 @@ async def test_operations_dashboard_exposes_kpis_events_and_transcript(
     summary = await client.get("/api/v1/operations/summary")
     assert summary.status_code == 200
     assert summary.json()["calls"] >= 1
+    assert summary.json()["calls_today"] >= 1
     assert summary.json()["open_work_orders"] >= 1
+    assert summary.json()["active_emergencies"] >= 1
+    assert summary.json()["urgent_open_work_orders"] >= 1
     assert summary.json()["emergency_escalations"] >= 1
 
     transcript = await client.get(

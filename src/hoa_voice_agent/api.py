@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
@@ -180,13 +181,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return int(await session.scalar(query) or 0)
 
         return {
-            "callers": await count(CallerProfileRecord),
             "unverified_callers": await count(
                 CallerProfileRecord,
                 CallerProfileRecord.identity_status == "unverified",
             ),
             "calls": await count(ConversationRecord),
+            "calls_today": await count(
+                ConversationRecord,
+                ConversationRecord.created_at >= datetime.now(UTC).replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                ),
+            ),
             "open_work_orders": await count(WorkOrderRecord, WorkOrderRecord.status == "open"),
+            "urgent_open_work_orders": await count(
+                WorkOrderRecord,
+                WorkOrderRecord.status == "open",
+                WorkOrderRecord.priority.in_(["urgent", "emergency"]),
+            ),
+            "active_emergencies": await count(
+                WorkOrderRecord,
+                WorkOrderRecord.status == "open",
+                WorkOrderRecord.priority == "emergency",
+            ),
             "emergency_escalations": await count(
                 WorkflowEventRecord,
                 WorkflowEventRecord.event_type == "transfer_requested",
@@ -195,7 +214,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 WorkflowEventRecord,
                 WorkflowEventRecord.event_type.endswith("_failed"),
             ),
-            "profile_corrections": await count(CallerProfileHistoryRecord),
         }
 
     @app.get("/api/v1/operations/callers")
