@@ -1,0 +1,4 @@
+interface:
+  display_name: "HOA Industry Expert"
+  short_description: "US HOA strategy, operations, and AI analysis"
+  default_prompt: "Use $hoa-industry-expert to analyze this HOA industry, operations, or product question with current cited evidence."

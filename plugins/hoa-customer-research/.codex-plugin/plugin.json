@@ -1,0 +1,18 @@
+{
+  "name": "hoa-customer-research",
+  "version": "0.1.0",
+  "description": "Evidence-backed HOA industry research and targeted customer-research workflows.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Hoa Customer Research",
+    "shortDescription": "Research HOA prospects and industry workflows.",
+    "longDescription": "Includes the HOA customer-research agent and HOA industry-expert skills, with source-backed qualification, targeted outreach, discovery analysis, and experiment guidance.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Use the HOA customer-research and HOA industry-expert skills to help with evidence-backed customer discovery."
+  }
+}

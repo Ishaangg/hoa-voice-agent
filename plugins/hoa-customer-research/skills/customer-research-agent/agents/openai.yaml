@@ -1,0 +1,4 @@
+interface:
+  display_name: "Customer Research Agent"
+  short_description: "Research HOA buyers and manage safe outreach"
+  default_prompt: "Use $customer-research-agent to research qualified HOA management prospects and prepare verified outreach drafts."
