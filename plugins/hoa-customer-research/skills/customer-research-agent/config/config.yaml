@@ -1,0 +1,164 @@
+project:
+  name: "HOA Voice Agent Customer Research"
+  domain: "US HOA and community-association management"
+  active: true
+
+ledger:
+  provider: "google_sheets"
+  spreadsheet_url: "https://docs.google.com/spreadsheets/d/15nqHX27Sr983zw44ns-RxnoAEzf66fJwSK_Ntddbugs/edit"
+  spreadsheet_id: "15nqHX27Sr983zw44ns-RxnoAEzf66fJwSK_Ntddbugs"
+
+tabs:
+  companies: "Companies"
+  people: "People"
+  outreach: "Outreach"
+  responses: "Responses"
+  suppression: "Suppression"
+
+research:
+  target_country: "United States"
+  target_industry: "HOA and community-association management"
+  targeting:
+    mode: "strict_workflow_first"
+    minimum_company_icp_score: 75
+    minimum_person_targeting_score: 75
+    require_two_company_fit_signals: true
+    require_workflow_signal: true
+    allow_quota_fill: false
+    max_active_contacts_per_company: 1
+    role_priority_by_workflow:
+      after_hours_emergency_support:
+        - "COO"
+        - "VP Operations"
+        - "Director of Operations"
+        - "Regional President"
+        - "Portfolio Manager"
+      resident_calls_and_service_requests:
+        - "COO"
+        - "VP Operations"
+        - "Director of Operations"
+        - "Portfolio Manager"
+        - "Customer Support"
+        - "Community Association Manager"
+      community_board_communication:
+        - "Regional President"
+        - "Portfolio Manager"
+        - "Community Association Manager"
+        - "VP Operations"
+      budget_and_roi:
+        - "Owner"
+        - "CEO"
+        - "CFO"
+        - "COO"
+    hard_disqualifiers:
+      - "rental_only"
+      - "unrelated_vendor"
+      - "recruiter_or_salesperson"
+      - "single_volunteer_run_association"
+      - "former_or_ambiguous_employee"
+      - "no_workflow_signal"
+      - "no_current_role_source"
+  search_strategy: "paginate_linkedin_and_multisource"
+  primary_discovery_source: "cai_filtered_directory"
+  minimum_linkedin_result_pages: 3
+  require_official_website_verification: true
+  minimum_supporting_sources: 2
+  discovery_mode: "rotating_frontier"
+  google_search_discovery: true
+  google_search_required_per_run: true
+  exclude_existing_companies_from_discovery: true
+  rediscovery_cooldown_days: 90
+  freshness_reverification_days: 90
+  query_rotation_dimensions:
+    - "state_or_metro"
+    - "company_type"
+    - "portfolio_size"
+    - "after_hours_signal"
+    - "role_or_workflow"
+    - "industry_directory"
+  source_rotation:
+    - "cai_filtered_directory"
+    - "google_search"
+    - "official_website"
+    - "state_records"
+    - "cai_directory_or_chapter"
+    - "official_events_and_speakers"
+    - "press_releases"
+    - "reputable_industry_reporting"
+    - "public_professional_profiles"
+  cai_directory:
+    enabled: true
+    url: "https://www.caionline.org/directory-of-credentialed-professionals/"
+    use_as_lead_source_only: true
+    primary_company_credential: "AAMC"
+    secondary_individual_credentials:
+      - "PCAM"
+      - "AMS"
+      - "LSM"
+    filter_rotation_dimensions:
+      - "state"
+      - "credential"
+      - "chapter_or_metro"
+      - "sort_order"
+      - "pagination"
+    credential_rotation:
+      - "AAMC"
+      - "PCAM"
+      - "AMS"
+      - "LSM"
+  target_company_types:
+    - "HOA management company"
+    - "community association management company"
+  preferred_roles:
+    - "Founder"
+    - "Owner"
+    - "CEO"
+    - "COO"
+    - "VP Operations"
+    - "Director of Operations"
+    - "Regional President"
+    - "Portfolio Manager"
+    - "Community Association Manager"
+
+channels:
+  email:
+    enabled: true
+    default_mode: "draft_only"
+  linkedin:
+    enabled: true
+    browser_skill: "Chrome:control-chrome"
+  company_contact_form:
+    enabled: true
+
+outreach_limits:
+  max_new_companies_per_run: 5
+  max_people_per_company: 2
+  max_new_emails_per_day: 5
+  max_linkedin_requests_per_day: 5
+  max_followups_per_person: 2
+
+deduplication:
+  check_email: true
+  check_linkedin_url: true
+  check_name_and_company: true
+  check_existing_outreach: true
+  check_suppression: true
+
+automation:
+  enabled: true
+  send_without_review: true
+  schedule: "daily"
+  run_time: "10:00"
+  first_followup_after_days: 5
+  second_followup_after_days: 11
+  close_sequence_after_days: 16
+  stop_on_linkedin_warning: true
+
+experiments:
+  enabled: false
+  minimum_sends_per_variant: 20
+  primary_metric: "qualified_reply_rate"
+
+timestamps:
+  timezone: "Asia/Kolkata"
+  format: "ISO-8601"
