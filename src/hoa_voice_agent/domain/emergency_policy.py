@@ -87,4 +87,3 @@ class EmergencyPolicyEngine:
                     transfer_to_on_call=False,
                     create_work_order=True,
                 )
-

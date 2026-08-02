@@ -18,9 +18,14 @@ class Settings(BaseSettings):
     operations_webhook_base_url: str | None = None
     operations_webhook_bearer_token: str | None = None
     sms_mode: Literal["fake", "twilio", "webhook"] = "fake"
+    vendor_notification_channel: Literal["whatsapp", "sms"] = "whatsapp"
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
     twilio_from_phone: str | None = None
+    twilio_whatsapp_from: str | None = None
+    twilio_whatsapp_content_sid: str | None = None
+    twilio_whatsapp_webhook_url: str | None = None
+    twilio_validate_webhooks: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

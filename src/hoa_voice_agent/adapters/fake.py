@@ -9,6 +9,8 @@ from hoa_voice_agent.domain.models import Community, Resident, WorkOrder
 
 MANAGEMENT_COMPANY_ID = UUID("10000000-0000-0000-0000-000000000001")
 COMMUNITY_ID = UUID("20000000-0000-0000-0000-000000000001")
+# Retained only so the seed migration can deactivate the previous two-community demo.
+LEGACY_REMOVED_COMMUNITY_ID = UUID("20000000-0000-0000-0000-000000000002")
 
 
 class FakeCommunityManagementAdapter(CommunityManagementAdapter):
@@ -39,6 +41,7 @@ class FakeCommunityManagementAdapter(CommunityManagementAdapter):
 class FakeMessagingAdapter(MessagingAdapter):
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
+        self.whatsapp_messages: list[tuple[str, str]] = []
 
     async def send_sms(
         self,
@@ -49,6 +52,16 @@ class FakeMessagingAdapter(MessagingAdapter):
     ) -> str:
         self.messages.append((phone, message))
         return f"sms-simulated-{len(self.messages)}"
+
+    async def send_whatsapp(
+        self,
+        phone: str,
+        message: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
+        self.whatsapp_messages.append((phone, message))
+        return f"whatsapp-simulated-{len(self.whatsapp_messages)}"
 
 
 class FakeCallControlAdapter(CallControlAdapter):

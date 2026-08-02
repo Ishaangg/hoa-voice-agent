@@ -8,6 +8,7 @@ from typing import Literal
 
 VoiceLanguage = Literal["en", "hi"]
 
+
 def tts_settings_for_language(
     language: VoiceLanguage,
     *,

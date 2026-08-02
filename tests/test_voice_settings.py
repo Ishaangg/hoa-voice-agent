@@ -71,6 +71,8 @@ def test_default_cartesia_voice_uses_a_calm_professional_style() -> None:
 
     assert settings.cartesia_tts_model == "sonic-3.5"
     assert settings.cartesia_tts_emotion == "calm"
+    assert settings.cartesia_tts_text_mode == "token"
+    assert settings.cartesia_tts_max_buffer_delay_ms == 250
     assert settings.cartesia_tts_english_voice
     assert settings.cartesia_tts_hindi_voice
     assert settings.voice_default_language == "en"

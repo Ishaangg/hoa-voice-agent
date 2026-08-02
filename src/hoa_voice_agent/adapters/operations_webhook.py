@@ -74,6 +74,16 @@ class WebhookCommunityManagementAdapter(CommunityManagementAdapter):
                 "incident_type": work_order.incident_type.value,
                 "priority": work_order.priority.value,
                 "description": work_order.description,
+                "status": work_order.status,
+                "assigned_to": work_order.assigned_to,
+                "assignee_type": work_order.assignee_type,
+                "price_status": work_order.price_status,
+                "price_shown_to_caller": work_order.price_shown_to_caller,
+                "resident_consent": work_order.resident_consent,
+                "quote_status": work_order.quote_status,
+                "quote_amount_cents": work_order.quote_amount_cents,
+                "final_amount_cents": work_order.final_amount_cents,
+                "billed_to": work_order.billed_to,
             },
             idempotency_key=f"work-order:{work_order.id}",
         )
@@ -95,6 +105,19 @@ class WebhookMessagingAdapter(MessagingAdapter):
             "/v1/messages/sms",
             {"to": phone, "message": message},
             idempotency_key=idempotency_key or f"sms:{phone}:{message}",
+        )
+
+    async def send_whatsapp(
+        self,
+        phone: str,
+        message: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
+        return await self._operations.post(
+            "/v1/messages/whatsapp",
+            {"to": phone, "message": message},
+            idempotency_key=idempotency_key or f"whatsapp:{phone}:{message}",
         )
 
 

@@ -15,9 +15,18 @@ from hoa_voice_agent.persistence.tables import (
     CommunityKnowledgeRecord,
     ConversationRecord,
     ConversationTurnRecord,
+    PendingDispatchRecord,
+    VendorDispatchRecord,
+    VendorRouteRecord,
     WorkflowEventRecord,
     WorkOrderRecord,
 )
+
+
+def normalize_phone_number(value: str) -> str:
+    value = value.removeprefix("whatsapp:")
+    digits = "".join(character for character in value if character.isdigit())
+    return f"+{digits}" if digits else value
 
 
 class ConversationTurnRepository:
@@ -66,9 +75,7 @@ class WorkflowEventRepository:
 
     async def list_recent(self, limit: int = 100) -> list[WorkflowEventRecord]:
         result = await self.session.scalars(
-            select(WorkflowEventRecord)
-            .order_by(WorkflowEventRecord.created_at.desc())
-            .limit(limit)
+            select(WorkflowEventRecord).order_by(WorkflowEventRecord.created_at.desc()).limit(limit)
         )
         return list(result)
 
@@ -267,11 +274,120 @@ class WorkOrderRepository:
             priority=work_order.priority.value,
             description=work_order.description,
             status=work_order.status,
+            assigned_to=work_order.assigned_to,
+            assignee_type=work_order.assignee_type,
+            price_status=work_order.price_status,
+            price_shown_to_caller=work_order.price_shown_to_caller,
+            resident_consent=work_order.resident_consent,
+            quote_status=work_order.quote_status,
+            quote_amount_cents=work_order.quote_amount_cents,
+            quote_approver=work_order.quote_approver,
+            final_amount_cents=work_order.final_amount_cents,
+            billed_to=work_order.billed_to,
+            dispatch_route_id=work_order.dispatch_route_id,
             created_at=work_order.created_at,
         )
         self.session.add(record)
         await self.session.commit()
         return work_order
+
+    async def get_pending_dispatch(self, conversation_id: UUID) -> PendingDispatchRecord | None:
+        return await self.session.scalar(
+            select(PendingDispatchRecord).where(
+                PendingDispatchRecord.conversation_id == conversation_id
+            )
+        )
+
+    async def save_pending_dispatch(self, **values) -> PendingDispatchRecord:
+        existing = await self.get_pending_dispatch(values["conversation_id"])
+        if existing:
+            for key, value in values.items():
+                setattr(existing, key, value)
+            record = existing
+        else:
+            record = PendingDispatchRecord(**values)
+            self.session.add(record)
+        await self.session.commit()
+        await self.session.refresh(record)
+        return record
+
+    async def delete_pending_dispatch(self, conversation_id: UUID) -> None:
+        record = await self.get_pending_dispatch(conversation_id)
+        if record:
+            await self.session.delete(record)
+            await self.session.commit()
+
+    async def create_vendor_dispatch(self, **values) -> VendorDispatchRecord:
+        if values.get("vendor_phone"):
+            values["vendor_phone"] = normalize_phone_number(values["vendor_phone"])
+        record = VendorDispatchRecord(**values)
+        self.session.add(record)
+        await self.session.commit()
+        await self.session.refresh(record)
+        return record
+
+    async def latest_vendor_dispatch_for_phone(self, phone: str) -> VendorDispatchRecord | None:
+        """Return the newest actionable dispatch for a verified vendor phone."""
+
+        return await self.session.scalar(
+            select(VendorDispatchRecord)
+            .where(
+                VendorDispatchRecord.vendor_phone == phone,
+                VendorDispatchRecord.status.in_([
+                    "pending",
+                    "sent",
+                    "acknowledged",
+                    "en_route",
+                    "quote_requested",
+                ]),
+            )
+            .order_by(VendorDispatchRecord.sent_at.desc(), VendorDispatchRecord.id.desc())
+        )
+
+    async def get_vendor_dispatch_for_inbound_reference(
+        self, phone: str, reference: str
+    ) -> VendorDispatchRecord | None:
+        return await self.session.scalar(
+            select(VendorDispatchRecord).where(
+                VendorDispatchRecord.vendor_phone == phone,
+                VendorDispatchRecord.last_inbound_reference == reference,
+            )
+        )
+
+    async def find_vendor_route(self, work_order: WorkOrder):
+        return await self.session.scalar(
+            select(VendorRouteRecord).where(
+                VendorRouteRecord.community_id == work_order.community_id,
+                VendorRouteRecord.management_company_id == work_order.management_company_id,
+                VendorRouteRecord.incident_type == work_order.incident_type.value,
+                VendorRouteRecord.is_active.is_(True),
+            )
+        )
+
+    async def get_vendor_route_by_id(self, route_id: UUID | None):
+        if route_id is None:
+            return None
+        return await self.session.get(VendorRouteRecord, route_id)
+
+    async def auto_assign_vendor(self, work_order: WorkOrder):
+        """Apply the approved community route for dispatchable incident types."""
+
+        route = await self.find_vendor_route(work_order)
+        if not route:
+            return None
+        record = await self.session.scalar(
+            select(WorkOrderRecord).where(WorkOrderRecord.id == work_order.id)
+        )
+        if not record:
+            return None
+        record.assigned_to = route.vendor_name
+        record.assignee_type = "vendor"
+        record.status = "assigned"
+        work_order.assigned_to = route.vendor_name
+        work_order.assignee_type = "vendor"
+        work_order.status = "assigned"
+        await self.session.commit()
+        return route
 
     async def list_for_conversation(self, conversation_id: UUID) -> list[WorkOrder]:
         result = await self.session.scalars(
@@ -290,6 +406,17 @@ class WorkOrderRepository:
                 priority=Priority(row.priority),
                 description=row.description,
                 status=row.status,
+                assigned_to=row.assigned_to,
+                assignee_type=row.assignee_type,
+                price_status=row.price_status,
+                price_shown_to_caller=row.price_shown_to_caller,
+                resident_consent=row.resident_consent,
+                quote_status=row.quote_status,
+                quote_amount_cents=row.quote_amount_cents,
+                quote_approver=row.quote_approver,
+                final_amount_cents=row.final_amount_cents,
+                billed_to=row.billed_to,
+                dispatch_route_id=row.dispatch_route_id,
                 created_at=row.created_at,
             )
             for row in result

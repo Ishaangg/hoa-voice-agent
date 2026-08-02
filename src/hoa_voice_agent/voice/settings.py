@@ -30,6 +30,10 @@ class VoiceRuntimeSettings(BaseSettings):
     cartesia_tts_hindi_voice: str = "95d51f79-c397-46f9-b49a-23763d3eaa2d"
     cartesia_tts_speed: float = 1.0
     cartesia_tts_emotion: str = "calm"
+    # Stream LLM text into Cartesia as it arrives. A small server-side buffer
+    # preserves prosody without waiting for a complete sentence.
+    cartesia_tts_text_mode: Literal["sentence", "token"] = "token"
+    cartesia_tts_max_buffer_delay_ms: int = 250
     nvidia_llm_base_url: str = "https://integrate.api.nvidia.com/v1"
     nvidia_llm_model: str = "nvidia/nemotron-3-nano-30b-a3b"
     nvidia_use_ssl: bool | None = None
@@ -39,9 +43,13 @@ class VoiceRuntimeSettings(BaseSettings):
     voice_turn_stop_secs: float = 0.45
     voice_llm_max_tokens: int = 32
     sms_mode: Literal["fake", "twilio"] = "fake"
+    vendor_notification_channel: Literal["whatsapp", "sms"] = "whatsapp"
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
     twilio_from_phone: str | None = None
+    twilio_whatsapp_from: str | None = None
+    twilio_whatsapp_content_sid: str | None = None
+    twilio_whatsapp_webhook_url: str | None = None
     # The exact public HTTPS URL configured on the Twilio phone number, and the
     # matching secure WebSocket URL that receives the Media Stream.
     twilio_voice_webhook_url: str | None = None
@@ -67,9 +75,7 @@ class VoiceRuntimeSettings(BaseSettings):
                 "to local endpoints."
             )
         if self.voice_stt_provider == "deepgram" and not self.deepgram_api_key:
-            raise ValueError(
-                "DEEPGRAM_API_KEY is required when VOICE_STT_PROVIDER=deepgram."
-            )
+            raise ValueError("DEEPGRAM_API_KEY is required when VOICE_STT_PROVIDER=deepgram.")
         if not self.cartesia_api_key:
             raise ValueError("CARTESIA_API_KEY is required for Cartesia voice output.")
         if self.sms_mode == "twilio" and not all(

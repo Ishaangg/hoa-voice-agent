@@ -44,8 +44,33 @@ an SMS one-time code before exposing account-specific data.
 
 At startup, the demo seeds approved Pine Grove facts into the `community_knowledge` database
 table. These facts cover office, amenities, parking, emergency, and routing topics. The agent
-uses only active facts from that community when answering an HOA question; production should
-replace the demo seed with staff-managed entries from an admin interface.
+uses only active facts from that community when answering an HOA question. The staff console
+now provides community-scoped knowledge management; only items with approval state `approved`
+become active for the agent.
+
+## Staff Operations Console
+
+The React console at `/operations` is the management-company surface: it prioritizes emergency
+and unassigned cases, shows call transcripts and caller context, supports acknowledge/assign/
+resolve actions with an immutable audit trail, and manages approved community knowledge and
+routing contacts. It uses a signed, HTTP-only pilot session cookie and company/community-scoped
+roles.
+
+Build it before starting FastAPI:
+
+```powershell
+npm install --prefix web
+npm run build --prefix web
+```
+
+The development seed supplies an Evergreen Community Management tenant with two communities:
+
+- `ops@evergreen.demo` / `demo-pass` — Operations Admin
+- `manager@evergreen.demo` / `demo-pass` — Pine Grove Community Manager
+- `oncall@evergreen.demo` / `demo-pass` — Pine Grove On-Call Responder
+
+Those credentials are local-pilot data only. Replace them with real provisioning and PostgreSQL
+before exposing the console to staff.
 
 ## Run with PostgreSQL and Redis
 

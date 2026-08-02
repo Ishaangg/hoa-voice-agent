@@ -55,4 +55,3 @@ def test_stopped_leak_is_urgent_but_does_not_force_transfer() -> None:
 
     assert decision.priority == Priority.URGENT
     assert decision.transfer_to_on_call is False
-

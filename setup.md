@@ -15,6 +15,7 @@ connects a Twilio phone number so people can call it.
 ## Prerequisites
 
 - Python 3.12 or 3.13.
+- Node.js 20 or newer (for the staff Operations Console build).
 - A NVIDIA API key for the hosted LLM service.
 - A Cartesia API key for streaming voice output.
 - Optional: a Twilio account and Voice-capable phone number for real calls.
@@ -63,6 +64,10 @@ CARTESIA_TTS_ENGLISH_VOICE=9626c31c-bec5-4cca-baa8-f8ba9e84c8bc
 CARTESIA_TTS_HINDI_VOICE=95d51f79-c397-46f9-b49a-23763d3eaa2d
 CARTESIA_TTS_SPEED=1.0
 CARTESIA_TTS_EMOTION=calm
+# Stream LLM text into Cartesia's WebSocket as it arrives.
+CARTESIA_TTS_TEXT_MODE=token
+# Small provider-side buffer to avoid one-token audio artifacts.
+CARTESIA_TTS_MAX_BUFFER_DELAY_MS=250
 # Choose the spoken language before starting a voice session. It remains fixed
 # throughout the call; a transcript can never change the TTS voice.
 VOICE_DEFAULT_LANGUAGE=en
@@ -80,7 +85,17 @@ language is intentionally fixed for a live call to keep voice output stable.
 
 Never commit `.env`. It contains API and Twilio credentials.
 
-## 3. Run the API and operations dashboard
+## 3. Build and run the staff Operations Console
+
+Install the React application dependencies and create its production bundle once (run this
+again whenever console source files change):
+
+```powershell
+npm install --prefix web
+npm run build --prefix web
+```
+
+Then start FastAPI in one PowerShell terminal:
 
 In one PowerShell terminal:
 
@@ -96,7 +111,18 @@ Open these URLs:
 
 The SQLite database is created at `hoa_voice_agent.db` by default. It contains caller
 profiles, conversations, transcript turns, work orders, workflow events, profile history,
-and approved community knowledge.
+approved community knowledge, staff accounts, sessions, routing contacts, vendor routes,
+and immutable case-action history.
+
+For the local pilot tenant, sign in at `/operations` with:
+
+- Operations Admin: `ops@evergreen.demo` / `demo-pass`
+- Community Manager: `manager@evergreen.demo` / `demo-pass`
+- On-Call Responder: `oncall@evergreen.demo` / `demo-pass`
+
+These accounts seed an Evergreen Community Management tenant with Pine Grove Community.
+They are demo credentials only; provision real staff identities and
+replace SQLite before a production deployment.
 
 ## 4. Test the voice agent in a browser
 
@@ -126,7 +152,56 @@ TWILIO_FROM_PHONE=+1xxxxxxxxxx
 US application-to-person SMS requires A2P 10DLC registration in Twilio for production use.
 Until registration is complete, SMS delivery may be restricted.
 
-## 6. Configure incoming Twilio phone calls
+## 6. Configure WhatsApp vendor dispatch (recommended)
+
+Vendor service requests use WhatsApp first and fall back to SMS if WhatsApp delivery fails.
+The vendor's registered phone number is verified against the dispatch before a reply can
+change a case. Vendors can reply `ACCEPT`, `DECLINE`, `ON MY WAY`, `QUOTE`, or `COMPLETED`.
+
+In Twilio, create or connect a WhatsApp Business sender and set:
+
+```env
+SMS_MODE=twilio
+VENDOR_NOTIFICATION_CHANNEL=whatsapp
+TWILIO_WHATSAPP_FROM=whatsapp:+1xxxxxxxxxx
+# Optional: an approved Content Template SID for business-initiated messages.
+TWILIO_WHATSAPP_CONTENT_SID=
+TWILIO_WHATSAPP_WEBHOOK_URL=https://your-public-domain/api/v1/webhooks/twilio/whatsapp
+TWILIO_VALIDATE_WEBHOOKS=true
+```
+
+Create an approved WhatsApp Content Template with one body variable (`{{1}}`) and quick
+reply buttons such as:
+
+```text
+Button label       Button payload
+Accept             ACCEPT
+Decline            DECLINE
+On my way          ON_MY_WAY
+```
+
+Paste the resulting Content SID into `TWILIO_WHATSAPP_CONTENT_SID`. The service still accepts
+typed `QUOTE` and `COMPLETED` replies; those can become follow-up buttons in a second template
+once the vendor accepts the request. Twilio quick replies are returned to the webhook as button
+text/payload, which the application maps to the dispatch state.
+
+If `TWILIO_WHATSAPP_CONTENT_SID` is blank, the adapter sends a normal message body. For
+production business-initiated WhatsApp messages, configure an approved Twilio/Meta template.
+Twilio posts inbound WhatsApp replies to the webhook above. The public URL must be reachable
+over HTTPS and must match the URL used for Twilio signature validation.
+
+For local testing, expose the FastAPI API (port 8000), not only the voice runtime:
+
+```powershell
+ngrok http 8000
+```
+
+Then set the resulting HTTPS URL in `TWILIO_WHATSAPP_WEBHOOK_URL` and restart FastAPI.
+
+WhatsApp actions update vendor-dispatch status, but they do not close a case automatically.
+Staff still approve quotes, record the final billed amount, and resolve the case.
+
+## 7. Configure incoming Twilio phone calls
 
 ### Start the Twilio phone runtime
 
@@ -203,7 +278,7 @@ ruff check .
 - Replace SQLite with PostgreSQL.
 - Host behind a stable HTTPS domain instead of a temporary ngrok address.
 - Keep webhook and Media Stream signature validation enabled.
-- Add staff authentication before exposing `/operations`.
+- Replace the demo staff accounts with your identity provider or managed staff provisioning.
 - Complete A2P 10DLC registration before relying on US SMS confirmations.
 - Implement the real Twilio on-call transfer adapter before treating emergency escalation as a
   live handoff.

@@ -47,7 +47,17 @@ class RuleBasedIncidentExtractor:
         ),
         (
             IncidentType.HVAC,
-            ("no heat", "no air", "air conditioning", "heater", "hvac", "ac is"),
+            (
+                "no heat",
+                "no air",
+                "air conditioning",
+                "air conditioner",
+                "ac unit",
+                "heater",
+                "hvac",
+                "cooling",
+                "ac is",
+            ),
         ),
         (
             IncidentType.COSMETIC,
@@ -62,6 +72,8 @@ class RuleBasedIncidentExtractor:
             if any(phrase in normalized for phrase in phrases):
                 incident_type = candidate
                 break
+        if incident_type == IncidentType.UNKNOWN and re.search(r"\bac\b", normalized):
+            incident_type = IncidentType.HVAC
 
         location_match = re.search(
             r"\b(?:at|in|near)\s+((?:building|unit|floor|hallway|garage|lobby)[^,.!?]*)",

@@ -21,6 +21,14 @@ class MessagingAdapter(Protocol):
         idempotency_key: str | None = None,
     ) -> str: ...
 
+    async def send_whatsapp(
+        self,
+        phone: str,
+        message: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> str: ...
+
 
 class CallControlAdapter(Protocol):
     async def transfer_to_on_call(self, conversation_id: UUID, phone: str) -> str: ...

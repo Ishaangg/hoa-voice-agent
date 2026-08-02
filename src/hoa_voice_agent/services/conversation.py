@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID
 
 from loguru import logger
@@ -20,7 +21,11 @@ from hoa_voice_agent.domain.incident_extractor import IncidentExtractor, RuleBas
 from hoa_voice_agent.domain.models import (
     ActionType,
     ConversationState,
+    EmergencyDecision,
+    IncidentReport,
+    IncidentType,
     Intent,
+    Priority,
     Resident,
     WorkflowAction,
     WorkOrder,
@@ -113,10 +118,12 @@ class ConversationService:
         community_management: CommunityManagementAdapter,
         messaging: MessagingAdapter,
         call_control: CallControlAdapter,
+        vendor_notification_channel: str = "whatsapp",
         incident_extractor: IncidentExtractor | None = None,
         conversation_responder: ConversationResponder | None = None,
     ) -> None:
         self.conversations = ConversationRepository(session)
+        self.session = session
         self.caller_profiles = CallerProfileRepository(session)
         self.community_knowledge = CommunityKnowledgeRepository(session)
         self.turns = ConversationTurnRepository(session)
@@ -125,6 +132,7 @@ class ConversationService:
         self.community_management = community_management
         self.messaging = messaging
         self.call_control = call_control
+        self.vendor_notification_channel = vendor_notification_channel
         self.extractor = incident_extractor or RuleBasedIncidentExtractor()
         self.conversation_responder = conversation_responder
         self.policy = EmergencyPolicyEngine()
@@ -177,8 +185,7 @@ class ConversationService:
             )
         else:
             greeting = (
-                f"Hi {resident.first_name}, thank you for calling {community.name}. "
-                "How can I help?"
+                f"Hi {resident.first_name}, thank you for calling {community.name}. How can I help?"
                 if resident
                 else (
                     f"Welcome back, {caller_profile.claimed_name} in "
@@ -219,6 +226,11 @@ class ConversationService:
         profile_update_response = await self._handle_profile_update(conversation, text)
         if profile_update_response:
             return profile_update_response
+        pending_response = await self._handle_pending_dispatch_confirmation(
+            conversation, community, text
+        )
+        if pending_response:
+            return pending_response
         if self._looks_like_maintenance(normalized):
             return await self._handle_maintenance(conversation, community, text)
 
@@ -275,6 +287,11 @@ class ConversationService:
         profile_update_response = await self._handle_profile_update(conversation, text)
         if profile_update_response:
             return VoiceTurnRoute(response=profile_update_response)
+        pending_response = await self._handle_pending_dispatch_confirmation(
+            conversation, community, text, language=language
+        )
+        if pending_response:
+            return VoiceTurnRoute(response=pending_response)
         if self._looks_like_maintenance(normalized):
             return VoiceTurnRoute(
                 response=await self._handle_maintenance(
@@ -320,10 +337,7 @@ class ConversationService:
             unit=unit,
         )
         if updated.caller_name and updated.caller_unit:
-            say = (
-                f"Thanks, {updated.caller_name} in {updated.caller_unit}. "
-                "How can I help today?"
-            )
+            say = f"Thanks, {updated.caller_name} in {updated.caller_unit}. How can I help today?"
         elif updated.caller_name:
             say = f"Thanks, {updated.caller_name}. What is your unit number?"
         elif updated.caller_unit:
@@ -409,6 +423,73 @@ class ConversationService:
             say=f"I heard {' and '.join(changes)}. Should I update your caller profile?",
         )
 
+    async def _handle_pending_dispatch_confirmation(
+        self,
+        conversation,
+        community,
+        text: str,
+        *,
+        language: str = "en",
+    ) -> ConversationTurnResponse | None:
+        pending = await self.work_orders.get_pending_dispatch(conversation.id)
+        if not pending:
+            return None
+        confirmation = self._normalized_confirmation(text)
+        if self._is_negative(confirmation):
+            await self.work_orders.delete_pending_dispatch(conversation.id)
+            return ConversationTurnResponse(
+                conversation_id=conversation.id,
+                intent=Intent.MAINTENANCE,
+                say=(
+                    "ठीक है, मैंने कोई सेवा बुक नहीं की।"
+                    if language == "hi"
+                    else "Okay, I did not book the service call."
+                ),
+            )
+        if not self._is_affirmative(confirmation):
+            return ConversationTurnResponse(
+                conversation_id=conversation.id,
+                intent=Intent.MAINTENANCE,
+                say=(
+                    "कृपया हाँ या नहीं बताइए।"
+                    if language == "hi"
+                    else "Please say yes to book the service call, or no to cancel."
+                ),
+            )
+        route = await self.work_orders.get_vendor_route_by_id(pending.route_id)
+        await self.work_orders.delete_pending_dispatch(conversation.id)
+        report = IncidentReport(
+            incident_type=IncidentType(pending.incident_type),
+            description=pending.description,
+        )
+        decision = self.policy.decide(report)
+        return await self._handle_maintenance(
+            conversation,
+            community,
+            pending.description,
+            language=language,
+            report_override=report,
+            route_override=route,
+            skip_consent=True,
+            decision_override=decision,
+            resident_consent="accepted",
+        )
+
+    @staticmethod
+    def _is_affirmative(text: str) -> bool:
+        if text in {
+            "yes", "yes please", "yeah", "yep", "sure", "okay", "ok", "correct",
+            "book it", "schedule it", "go ahead", "haan", "han", "हां", "हाँ",
+        }:
+            return True
+        return text.startswith(("yes ", "yeah ", "yep ", "sure ", "okay ", "haan ", "हाँ "))
+
+    @staticmethod
+    def _is_negative(text: str) -> bool:
+        if text in {"no", "no thanks", "nope", "cancel", "never mind", "not now", "nah"}:
+            return True
+        return text.startswith(("no ", "nope ", "cancel ", "never mind ", "not now "))
+
     async def _handle_maintenance(
         self,
         conversation,
@@ -416,9 +497,76 @@ class ConversationService:
         text: str,
         *,
         language: str = "en",
+        report_override: IncidentReport | None = None,
+        route_override=None,
+        skip_consent: bool = False,
+        decision_override: EmergencyDecision | None = None,
+        resident_consent: str = "not_required",
     ) -> ConversationTurnResponse:
-        report = await self.extractor.extract(text)
-        decision = self.policy.decide(report)
+        report = report_override or await self.extractor.extract(text)
+        decision = decision_override or self.policy.decide(report)
+        vendor_route = route_override
+        if decision.dispatch_vendor and vendor_route is None:
+            vendor_probe = WorkOrder(
+                conversation_id=conversation.id,
+                management_company_id=conversation.management_company_id,
+                community_id=conversation.community_id,
+                resident_id=conversation.resident_id,
+                incident_type=report.incident_type,
+                priority=decision.priority,
+                description=report.description,
+            )
+            vendor_route = await self.work_orders.find_vendor_route(vendor_probe)
+        consent_required = bool(
+            vendor_route
+            and decision.dispatch_vendor
+            and not skip_consent
+            and decision.priority != Priority.EMERGENCY
+            and (
+                vendor_route.dispatch_mode == "inspection_only"
+                or vendor_route.payer_responsibility != "association"
+                or (
+                    vendor_route.dispatch_mode == "auto_up_to_limit"
+                    and vendor_route.automatic_approval_limit_cents is None
+                )
+            )
+        )
+        if consent_required:
+            fee = vendor_route.diagnostic_fee_cents
+            if fee is None:
+                price_status = "unknown"
+                disclosure = (
+                    "The final repair cost is not available yet. I can schedule an inspection; "
+                    "any repair beyond the visit requires your approval. "
+                    "Would you like me to schedule it?"
+                )
+            else:
+                price_status = "known"
+                disclosure = (
+                    f"The diagnostic visit costs ${fee / 100:.2f}. Any repair beyond "
+                    "that requires approval. "
+                    "Would you like me to schedule the visit?"
+                )
+            await self.work_orders.save_pending_dispatch(
+                conversation_id=conversation.id,
+                management_company_id=conversation.management_company_id,
+                community_id=conversation.community_id,
+                incident_type=report.incident_type.value,
+                priority=decision.priority.value,
+                description=report.description,
+                route_id=vendor_route.id,
+                price_status=price_status,
+                price_disclosure=disclosure,
+            )
+            await self.workflow_events.add(
+                conversation.id, "vendor_consent_requested", disclosure, None
+            )
+            return ConversationTurnResponse(
+                conversation_id=conversation.id,
+                intent=Intent.MAINTENANCE,
+                say=disclosure,
+                decision=decision,
+            )
         work_order = WorkOrder(
             conversation_id=conversation.id,
             management_company_id=conversation.management_company_id,
@@ -427,9 +575,98 @@ class ConversationService:
             incident_type=report.incident_type,
             priority=decision.priority,
             description=report.description,
+            price_status=(
+                "known"
+                if vendor_route and vendor_route.diagnostic_fee_cents is not None
+                else "unknown"
+            ),
+            price_shown_to_caller=(
+                f"${vendor_route.diagnostic_fee_cents / 100:.2f} diagnostic fee"
+                if vendor_route and vendor_route.diagnostic_fee_cents is not None
+                else None
+            ),
+            resident_consent=(
+                "not_required" if decision.priority == Priority.EMERGENCY else resident_consent
+            ),
+            quote_status=(
+                "pending"
+                if vendor_route and vendor_route.dispatch_mode == "inspection_only"
+                else "not_required"
+            ),
+            dispatch_route_id=vendor_route.id if vendor_route else None,
         )
+        if vendor_route and decision.dispatch_vendor:
+            work_order.assigned_to = vendor_route.vendor_name
+            work_order.assignee_type = "vendor"
+            work_order.status = "assigned"
         await self.community_management.create_work_order(work_order)
         await self.work_orders.create(work_order)
+        if vendor_route and decision.dispatch_vendor:
+            dispatch = await self.work_orders.create_vendor_dispatch(
+                work_order_id=work_order.id,
+                vendor_id=vendor_route.vendor_id,
+                vendor_name=vendor_route.vendor_name,
+                vendor_phone=vendor_route.contact_phone,
+                decision="approved",
+                reason=(
+                    "Emergency mitigation" if decision.priority == Priority.EMERGENCY
+                    else "Caller consented to the approved service call"
+                ),
+                notification_channel=self.vendor_notification_channel,
+                status="pending",
+            )
+            if vendor_route.contact_phone:
+                dispatch.attempt_count = 1
+                try:
+                    dispatch_message = (
+                        f"HOA service request {work_order.id}: "
+                        f"{work_order.incident_type.value} at {community.name}. "
+                        f"{work_order.description} Reply ACCEPT, DECLINE, ON MY WAY, "
+                        "QUOTE, or COMPLETED."
+                    )
+                    if self.vendor_notification_channel == "whatsapp":
+                        try:
+                            dispatch.provider_reference = await self.messaging.send_whatsapp(
+                                vendor_route.contact_phone,
+                                dispatch_message,
+                                idempotency_key=f"vendor-dispatch:{work_order.id}",
+                            )
+                        except Exception as whatsapp_exc:
+                            logger.warning(
+                                "WhatsApp vendor notification failed for {}; "
+                                "trying SMS fallback: {}",
+                                work_order.id,
+                                whatsapp_exc,
+                            )
+                            dispatch.provider_reference = await self.messaging.send_sms(
+                                vendor_route.contact_phone,
+                                dispatch_message,
+                                idempotency_key=f"vendor-dispatch-sms-fallback:{work_order.id}",
+                            )
+                            dispatch.notification_channel = "sms_fallback"
+                    else:
+                        dispatch.provider_reference = await self.messaging.send_sms(
+                            vendor_route.contact_phone,
+                            dispatch_message,
+                            idempotency_key=f"vendor-dispatch:{work_order.id}",
+                        )
+                    dispatch.status = "sent"
+                    dispatch.sent_at = datetime.now(UTC)
+                except Exception as exc:
+                    dispatch.status = "failed"
+                    dispatch.failure_detail = str(exc)
+                    logger.error("Vendor notification failed for {}: {}", work_order.id, exc)
+                await self.session.commit()
+                await self.workflow_events.add(
+                    conversation.id,
+                    (
+                        "vendor_notification_failed"
+                        if dispatch.status == "failed"
+                        else "vendor_notification_sent"
+                    ),
+                    dispatch.failure_detail or dispatch.provider_reference or dispatch.status,
+                    work_order.id,
+                )
 
         actions = [
             WorkflowAction(
@@ -444,6 +681,13 @@ class ConversationService:
             f"{decision.priority.value} work order created",
             work_order.id,
         )
+        if vendor_route:
+            await self.workflow_events.add(
+                conversation.id,
+                "vendor_assigned",
+                f"Automatically assigned to {vendor_route.vendor_name}",
+                work_order.id,
+            )
 
         sms_sent = False
         resident = await self.community_management.find_resident(conversation.caller_phone)
@@ -510,6 +754,16 @@ class ConversationService:
             )
 
         spoken_parts = self._localized_safety_instructions(decision.instructions, language)
+        if (
+            decision.priority == Priority.EMERGENCY
+            and vendor_route
+            and vendor_route.diagnostic_fee_cents is None
+        ):
+            spoken_parts.append(
+                "The final repair price is not available yet. "
+                "Emergency mitigation is being dispatched; "
+                "any additional repair requires approval."
+            )
         if sms_sent:
             spoken_parts.append(
                 "मैंने कार्य अनुरोध बनाया है और पुष्टि संदेश भेज दिया है।"
@@ -640,18 +894,12 @@ class ConversationService:
         if name:
             name = name.strip(" .,-")
         unit_value = (
-            next((group for group in unit_match.groups() if group), None)
-            if unit_match
-            else None
+            next((group for group in unit_match.groups() if group), None) if unit_match else None
         )
         normalized_unit = (
             ConversationService._normalize_spoken_unit(unit_value) if unit_value else None
         )
-        unit = (
-            f"Unit {normalized_unit}"
-            if normalized_unit
-            else None
-        )
+        unit = f"Unit {normalized_unit}" if normalized_unit else None
         return name, unit
 
     @staticmethod
@@ -682,7 +930,7 @@ class ConversationService:
     def _normalized_confirmation(text: str) -> str:
         """Normalize STT punctuation without weakening the confirmation requirement."""
 
-        return " ".join(re.findall(r"[a-z]+", text.lower()))
+        return " ".join(re.findall(r"\w+", text.lower(), flags=re.UNICODE))
 
     @staticmethod
     def _voice_system_prompt(

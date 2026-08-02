@@ -77,7 +77,7 @@ def create_stt(settings: VoiceRuntimeSettings):
         from pipecat.services.deepgram.stt import DeepgramSTTService
     except ImportError as exc:
         raise RuntimeError(
-            "Deepgram support is not installed. Run: python -m pip install -e \".[voice]\""
+            'Deepgram support is not installed. Run: python -m pip install -e ".[voice]"'
         ) from exc
     return DeepgramSTTService(
         api_key=settings.deepgram_api_key,
@@ -111,6 +111,8 @@ async def run_bot(
                 account_sid=settings.twilio_account_sid,
                 auth_token=settings.twilio_auth_token,
                 from_phone=settings.twilio_from_phone,
+                whatsapp_from=settings.twilio_whatsapp_from,
+                whatsapp_content_sid=settings.twilio_whatsapp_content_sid,
             )
             if settings.sms_mode == "twilio"
             else FakeMessagingAdapter()
@@ -120,6 +122,7 @@ async def run_bot(
             community_management=community_management,
             messaging=messaging,
             call_control=FakeCallControlAdapter(),
+            vendor_notification_channel=settings.vendor_notification_channel,
             incident_extractor=NvidiaIncidentExtractor(
                 api_key=settings.nvidia_api_key,
                 base_url=settings.nvidia_llm_base_url,
@@ -152,7 +155,12 @@ async def run_bot(
                     emotion=settings.cartesia_tts_emotion,
                 ),
             ),
-            text_aggregation_mode=TextAggregationMode.SENTENCE,
+            text_aggregation_mode=TextAggregationMode(settings.cartesia_tts_text_mode),
+            max_buffer_delay_ms=(
+                settings.cartesia_tts_max_buffer_delay_ms
+                if settings.cartesia_tts_text_mode == "token"
+                else None
+            ),
         )
         llm = NvidiaLLMService(
             api_key=settings.nvidia_api_key,
@@ -224,9 +232,7 @@ async def run_bot(
                 task.id,
                 conversation.conversation_id,
             )
-            await task.queue_frames(
-                [TTSSpeakFrame(conversation.say)]
-            )
+            await task.queue_frames([TTSSpeakFrame(conversation.say)])
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(_transport, _connection) -> None:
@@ -381,7 +387,7 @@ def main() -> None:
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "The Pipecat runner is missing. Install the optional voice runtime with "
-            "`python -m pip install -e \".[voice]\"`."
+            '`python -m pip install -e ".[voice]"`.'
         ) from exc
     # Validate before the browser can connect. This prevents a configuration error
     # from appearing as an apparently successful but silent WebRTC session.

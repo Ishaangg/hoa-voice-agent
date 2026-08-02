@@ -80,6 +80,17 @@ class WorkOrder(TenantContext):
     priority: Priority
     description: str
     status: str = "open"
+    assigned_to: str | None = None
+    assignee_type: str | None = None
+    price_status: str = "unknown"
+    price_shown_to_caller: str | None = None
+    resident_consent: str = "not_required"
+    quote_status: str = "not_required"
+    quote_amount_cents: int | None = None
+    quote_approver: str | None = None
+    final_amount_cents: int | None = None
+    billed_to: str | None = None
+    dispatch_route_id: UUID | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

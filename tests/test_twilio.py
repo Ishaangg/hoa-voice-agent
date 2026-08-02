@@ -58,3 +58,32 @@ async def test_twilio_error_includes_the_provider_error_code() -> None:
         assert str(exc) == "Twilio SMS error 21408: Destination region is disabled."
     else:
         raise AssertionError("Expected TwilioMessageError")
+
+
+async def test_twilio_whatsapp_uses_whatsapp_addresses() -> None:
+    captured: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured
+        captured = request
+        return httpx.Response(201, json={"sid": "SMWA123"})
+
+    adapter = TwilioMessagingAdapter(
+        account_sid="AC123",
+        auth_token="secret-token",
+        from_phone="+15550102000",
+        whatsapp_from="whatsapp:+15550102001",
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    reference = await adapter.send_whatsapp(
+        "+15550101111",
+        "Reply ACCEPT to take this request.",
+        idempotency_key="whatsapp:work-order-123",
+    )
+
+    assert reference == "twilio:SMWA123"
+    assert captured is not None
+    assert b"To=whatsapp%3A%2B15550101111" in captured.content
+    assert b"From=whatsapp%3A%2B15550102001" in captured.content
+    assert b"Reply+ACCEPT+to+take+this+request." in captured.content

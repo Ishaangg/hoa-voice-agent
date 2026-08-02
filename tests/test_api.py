@@ -245,12 +245,106 @@ async def test_active_leak_creates_work_order_sms_and_transfer(
         "transfer_requested",
     ]
 
-    work_orders = await client.get(
-        f"/api/v1/conversations/{conversation_id}/work-orders"
-    )
+    work_orders = await client.get(f"/api/v1/conversations/{conversation_id}/work-orders")
     assert work_orders.status_code == 200
     assert len(work_orders.json()) == 1
     assert work_orders.json()[0]["priority"] == "emergency"
+    assert work_orders.json()[0]["assigned_to"] == "Rapid Response Restoration"
+    assert work_orders.json()[0]["assignee_type"] == "vendor"
+
+
+async def test_hvac_discloses_diagnostic_fee_and_requires_consent(
+    client: httpx.AsyncClient,
+) -> None:
+    conversation_id = await start_conversation(client)
+    pending = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "My HVAC is not working."},
+    )
+    assert pending.status_code == 200
+    assert pending.json()["work_order"] is None
+    assert "$150.00" in pending.json()["say"]
+    assert "approval" in pending.json()["say"]
+
+    declined = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns", json={"text": "No, thanks."}
+    )
+    assert declined.status_code == 200
+    assert "did not book" in declined.json()["say"]
+    assert (await client.get(f"/api/v1/conversations/{conversation_id}/work-orders")).json() == []
+
+
+async def test_hvac_consent_assigns_vendor_and_records_dispatch(
+    client: httpx.AsyncClient,
+) -> None:
+    conversation_id = await start_conversation(client)
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "The HVAC system is broken."},
+    )
+    booked = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns", json={"text": "Yes, schedule it."}
+    )
+    assert booked.status_code == 200
+    work_order = booked.json()["work_order"]
+    assert work_order["assigned_to"] == "Northstar Mechanical"
+    assert work_order["resident_consent"] == "accepted"
+    detail = await client.post(
+        "/api/v1/console/auth/login",
+        json={"email": "ops@evergreen.demo", "password": "demo-pass"},
+    )
+    assert detail.status_code == 200
+    case = await client.get(f"/api/v1/console/cases/{work_order['id']}")
+    assert case.status_code == 200
+    assert case.json()["cost"]["price_status"] == "known"
+    assert case.json()["vendor_dispatch"]["status"] == "sent"
+    assert case.json()["vendor_dispatch"]["notification_channel"] == "whatsapp"
+
+
+async def test_vendor_whatsapp_acknowledgement_updates_dispatch_and_case(
+    client: httpx.AsyncClient,
+) -> None:
+    conversation_id = await start_conversation(client)
+    await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns",
+        json={"text": "The HVAC system is broken."},
+    )
+    booked = await client.post(
+        f"/api/v1/conversations/{conversation_id}/turns", json={"text": "Yes, schedule it."}
+    )
+    work_order_id = booked.json()["work_order"]["id"]
+
+    inbound = await client.post(
+        "/api/v1/webhooks/twilio/whatsapp",
+        content="From=whatsapp%3A%2B15550104000&Body=ACCEPT&MessageSid=SMvendor1",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert inbound.status_code == 200
+    assert "acknowledged" in inbound.text.lower()
+
+    await client.post(
+        "/api/v1/console/auth/login",
+        json={"email": "ops@evergreen.demo", "password": "demo-pass"},
+    )
+    detail = await client.get(f"/api/v1/console/cases/{work_order_id}")
+    assert detail.json()["vendor_dispatch"]["status"] == "acknowledged"
+    assert any(item["type"] == "vendor_acknowledged" for item in detail.json()["timeline"])
+
+    on_the_way = await client.post(
+        "/api/v1/webhooks/twilio/whatsapp",
+        content="From=whatsapp%3A%2B15550104000&ButtonPayload=ON_MY_WAY&MessageSid=SMvendor2",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert on_the_way.status_code == 200
+    detail = await client.get(f"/api/v1/console/cases/{work_order_id}")
+    assert detail.json()["vendor_dispatch"]["status"] == "en_route"
+
+    duplicate = await client.post(
+        "/api/v1/webhooks/twilio/whatsapp",
+        content="From=whatsapp%3A%2B15550104000&Body=ACCEPT&MessageSid=SMvendor1",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert duplicate.status_code == 200
 
 
 async def test_lift_entrapment_is_an_emergency_and_transfers_to_on_call(
@@ -296,7 +390,7 @@ async def test_operations_dashboard_exposes_kpis_events_and_transcript(
 
     dashboard = await client.get("/operations")
     assert dashboard.status_code == 200
-    assert "Operations Control Room" in dashboard.text
+    assert "Evergreen Operations" in dashboard.text
 
     summary = await client.get("/api/v1/operations/summary")
     assert summary.status_code == 200
@@ -307,9 +401,7 @@ async def test_operations_dashboard_exposes_kpis_events_and_transcript(
     assert summary.json()["urgent_open_work_orders"] >= 1
     assert summary.json()["emergency_escalations"] >= 1
 
-    transcript = await client.get(
-        f"/api/v1/operations/transcripts/{conversation_id}"
-    )
+    transcript = await client.get(f"/api/v1/operations/transcripts/{conversation_id}")
     assert [turn["speaker"] for turn in transcript.json()] == [
         "assistant",
         "user",
