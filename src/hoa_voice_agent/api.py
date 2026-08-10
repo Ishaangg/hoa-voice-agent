@@ -1,10 +1,12 @@
-from contextlib import asynccontextmanager
+# ruff: noqa: E501
+import asyncio
+import json
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import parse_qs
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -18,6 +20,7 @@ from hoa_voice_agent.adapters.fake import (
     FakeCommunityManagementAdapter,
     FakeMessagingAdapter,
 )
+from hoa_voice_agent.adapters.hotel_pms import HotelPMSAdapter
 from hoa_voice_agent.adapters.operations_webhook import (
     OperationsWebhookClient,
     WebhookCallControlAdapter,
@@ -32,6 +35,13 @@ from hoa_voice_agent.api_models import (
     ConversationTurnRequest,
     ConversationTurnResponse,
     HealthResponse,
+    HotelConversationTurnResponse,
+    HotelMenuItemCreateRequest,
+    HotelMenuItemUpdateRequest,
+    HotelReservationCreateRequest,
+    HotelReservationUpdateRequest,
+    HotelStartConversationRequest,
+    HotelStartConversationResponse,
     KnowledgeUpsertRequest,
     QuoteRequest,
     ResidentConsentRequest,
@@ -44,8 +54,26 @@ from hoa_voice_agent.api_models import (
 )
 from hoa_voice_agent.config import Settings, get_settings
 from hoa_voice_agent.domain.models import WorkOrder
+from hoa_voice_agent.persistence import hotel_tables as _hotel_tables  # noqa: F401
 from hoa_voice_agent.persistence import tables as _tables  # noqa: F401
 from hoa_voice_agent.persistence.database import Database
+from hoa_voice_agent.persistence.hotel_tables import (
+    HotelConversationRecord,
+    HotelConversationTurnRecord,
+    HotelDepartmentRecord,
+    HotelGuestRecord,
+    HotelKnowledgeRecord,
+    HotelMenuItemRecord,
+    HotelRecord,
+    HotelRequestActionRecord,
+    HotelRequestRecord,
+    HotelReservationRecord,
+    HotelReservationRoomRecord,
+    HotelRoomRecord,
+    HotelSessionRecord,
+    HotelStaffMembershipRecord,
+    HotelStaffUserRecord,
+)
 from hoa_voice_agent.persistence.repository import (
     ConversationTurnRepository,
     WorkflowEventRepository,
@@ -54,6 +82,7 @@ from hoa_voice_agent.persistence.repository import (
 )
 from hoa_voice_agent.persistence.seed import (
     seed_demo_community_knowledge,
+    seed_demo_hotel,
     seed_demo_operations_console,
 )
 from hoa_voice_agent.persistence.tables import (
@@ -71,6 +100,7 @@ from hoa_voice_agent.persistence.tables import (
     VendorDispatchRecord,
     VendorRecord,
     VendorRouteRecord,
+    VoiceMetricRecord,
     WorkflowEventRecord,
     WorkOrderRecord,
 )
@@ -79,14 +109,21 @@ from hoa_voice_agent.services.conversation import (
     ConversationNotFoundError,
     ConversationService,
 )
-from hoa_voice_agent.services.nvidia_conversation_responder import NvidiaConversationResponder
-from hoa_voice_agent.services.nvidia_incident_extractor import NvidiaIncidentExtractor
+from hoa_voice_agent.services.hotel_audit import HotelConversationAuditLog
+from hoa_voice_agent.services.hotel_conversation import (
+    HotelConversationNotFoundError,
+    HotelConversationService,
+)
+from hoa_voice_agent.services.hotel_turn_interpreter import OpenAIHotelTurnInterpreter
+from hoa_voice_agent.services.openai_conversation_responder import OpenAIConversationResponder
+from hoa_voice_agent.services.openai_incident_extractor import OpenAIIncidentExtractor
 from hoa_voice_agent.services.operations_console import (
     hash_session_token,
     new_session_token,
     verify_password,
 )
-from hoa_voice_agent.voice.twilio_voice import is_valid_twilio_request
+from hoa_voice_agent.services.outbox import OutboxNotificationQueue, OutboxWorker
+from hoa_voice_agent.voice.twilio_voice import is_valid_twilio_request, parse_twilio_form
 
 
 @dataclass(frozen=True)
@@ -99,13 +136,37 @@ class ConsolePrincipal:
     community_id: UUID | None
 
 
+@dataclass(frozen=True)
+class HotelPrincipal:
+    user_id: UUID
+    display_name: str
+    email: str
+    organization_id: UUID
+    hotel_id: UUID
+    role: str
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or get_settings()
-    database = Database(app_settings.database_url)
-
+    hotel_audit_log = HotelConversationAuditLog(app_settings.hotel_audit_log_path)
+    hotel_interpreter = (
+        OpenAIHotelTurnInterpreter(
+            api_key=app_settings.hotel_llm_api_key,
+            base_url=app_settings.hotel_llm_base_url,
+            model=app_settings.hotel_llm_model,
+            reasoning_effort=app_settings.hotel_llm_reasoning_effort,
+        )
+        if app_settings.hotel_llm_api_key
+        else None
+    )
+    database = Database(
+        app_settings.database_url,
+        auto_create_schema=app_settings.database_auto_create,
+    )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.database = database
+        app.state.hotel_interpreter = hotel_interpreter
         directory = FakeCommunityManagementAdapter()
         operations: OperationsWebhookClient | None = None
         if app_settings.operations_mode == "webhook":
@@ -162,9 +223,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with database.session_factory() as seed_session:
             await seed_demo_community_knowledge(seed_session)
             await seed_demo_operations_console(seed_session)
+            await seed_demo_hotel(seed_session)
+        outbox_worker: OutboxWorker | None = None
+        outbox_task = None
+        if app_settings.outbox_enabled and app_settings.outbox_worker_in_process:
+            outbox_worker = OutboxWorker(
+                database,
+                app.state.messaging,
+                poll_interval_seconds=app_settings.outbox_poll_interval_seconds,
+                batch_size=app_settings.outbox_batch_size,
+                max_attempts=app_settings.outbox_max_attempts,
+                processing_timeout_seconds=app_settings.outbox_processing_timeout_seconds,
+            )
+            outbox_task = asyncio.create_task(outbox_worker.run())
         try:
             yield
         finally:
+            if outbox_worker:
+                await outbox_worker.stop()
+            if outbox_task:
+                outbox_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await outbox_task
             if operations:
                 await operations.close()
             await database.dispose()
@@ -225,6 +305,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             community_id=membership.community_id,
         )
 
+    async def get_hotel_principal(
+        request: Request,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> HotelPrincipal:
+        token = request.cookies.get("hoa_ops_session")
+        if not token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in required")
+        hotel_session = await session.scalar(
+            select(HotelSessionRecord).where(
+                HotelSessionRecord.token_hash == hash_session_token(token),
+                HotelSessionRecord.expires_at > datetime.now(UTC),
+            )
+        )
+        if not hotel_session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Hotel session expired"
+            )
+        user = await session.get(HotelStaffUserRecord, hotel_session.staff_user_id)
+        membership = await session.scalar(
+            select(HotelStaffMembershipRecord).where(
+                HotelStaffMembershipRecord.staff_user_id == hotel_session.staff_user_id,
+                HotelStaffMembershipRecord.organization_id == hotel_session.organization_id,
+                HotelStaffMembershipRecord.hotel_id == hotel_session.hotel_id,
+            )
+        )
+        if not user or not user.is_active or not membership:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Hotel access unavailable"
+            )
+        return HotelPrincipal(
+            user_id=user.id,
+            display_name=user.display_name,
+            email=user.email,
+            organization_id=membership.organization_id,
+            hotel_id=membership.hotel_id or hotel_session.hotel_id,
+            role=membership.role,
+        )
+
     def require_role(principal: ConsolePrincipal, *roles: str) -> None:
         if principal.role not in roles:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
@@ -278,21 +396,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session: Annotated[AsyncSession, Depends(get_session)],
     ) -> ConversationService:
         incident_extractor = (
-            NvidiaIncidentExtractor(
-                api_key=app_settings.nvidia_api_key,
-                base_url=app_settings.nvidia_llm_base_url,
-                model=app_settings.nvidia_llm_model,
+            OpenAIIncidentExtractor(
+                api_key=app_settings.groq_api_key,
+                base_url=app_settings.groq_llm_base_url,
+                model=app_settings.groq_llm_model,
             )
-            if app_settings.nvidia_api_key
+            if app_settings.groq_api_key
             else None
         )
         conversation_responder = (
-            NvidiaConversationResponder(
-                api_key=app_settings.nvidia_api_key,
-                base_url=app_settings.nvidia_llm_base_url,
-                model=app_settings.nvidia_llm_model,
+            OpenAIConversationResponder(
+                api_key=app_settings.groq_api_key,
+                base_url=app_settings.groq_llm_base_url,
+                model=app_settings.groq_llm_model,
             )
-            if app_settings.nvidia_api_key
+            if app_settings.groq_api_key
             else None
         )
         return ConversationService(
@@ -303,6 +421,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             vendor_notification_channel=app_settings.vendor_notification_channel,
             incident_extractor=incident_extractor,
             conversation_responder=conversation_responder,
+            notification_queue=(
+                OutboxNotificationQueue(session) if app_settings.outbox_enabled else None
+            ),
+            audit_log=hotel_audit_log,
         )
 
     @app.get("/health", response_model=HealthResponse)
@@ -317,7 +439,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Process a registered vendor's WhatsApp action for its newest dispatch."""
 
         raw_body = (await request.body()).decode("utf-8")
-        form_values = {key: values[-1] for key, values in parse_qs(raw_body).items()}
+        form_values = parse_twilio_form(raw_body)
         if app_settings.twilio_validate_webhooks and app_settings.sms_mode == "twilio":
             webhook_url = app_settings.twilio_whatsapp_webhook_url
             if not webhook_url:
@@ -355,8 +477,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         action_text = " ".join(
-            form_values.get(key, "")
-            for key in ("ButtonPayload", "ButtonText", "Body")
+            form_values.get(key, "") for key in ("ButtonPayload", "ButtonText", "Body")
         ).lower()
         if any(
             term in action_text
@@ -385,8 +506,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         elif "quote" in action_text or "request_quote" in action_text:
             action = "quote_requested"
             reply = (
-                "Thanks. Please submit the quote through the secure link "
-                "provided by the HOA team."
+                "Thanks. Please submit the quote through the secure link provided by the HOA team."
             )
         elif any(
             term in action_text
@@ -400,8 +520,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ):
             action = "completed"
             reply = (
-                "Thanks. We marked the service work completed; "
-                "the HOA team will close the case."
+                "Thanks. We marked the service work completed; the HOA team will close the case."
             )
         elif any(term in action_text for term in ("accept", "accepted", "yes", "take")):
             action = "acknowledged"
@@ -509,6 +628,717 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def console_logout(response: Response) -> Response:
         response.delete_cookie("hoa_ops_session")
         return response
+
+    @app.post("/api/v1/hotel/auth/login")
+    async def hotel_login(
+        body: StaffLoginRequest,
+        response: Response,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        """Create a hotel-only session; HOA memberships are not accepted here."""
+
+        user = await session.scalar(
+            select(HotelStaffUserRecord).where(HotelStaffUserRecord.email == body.email.lower())
+        )
+        if not user or not user.is_active or not verify_password(body.password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
+            )
+        membership = await session.scalar(
+            select(HotelStaffMembershipRecord).where(
+                HotelStaffMembershipRecord.staff_user_id == user.id,
+            )
+        )
+        if not membership or not membership.hotel_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No hotel membership")
+        token = new_session_token()
+        hotel = await session.get(HotelRecord, membership.hotel_id)
+        if not hotel:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Hotel is unavailable"
+            )
+        session.add(
+            HotelSessionRecord(
+                token_hash=hash_session_token(token),
+                staff_user_id=user.id,
+                organization_id=membership.organization_id,
+                hotel_id=membership.hotel_id,
+                expires_at=datetime.now(UTC) + timedelta(hours=12),
+            )
+        )
+        await session.commit()
+        response.set_cookie(
+            "hoa_ops_session",
+            token,
+            httponly=True,
+            samesite="lax",
+            secure=app_settings.app_env == "production",
+            max_age=60 * 60 * 12,
+        )
+        return {
+            "display_name": user.display_name,
+            "role": membership.role,
+            "hotel_id": str(hotel.id),
+        }
+
+    @app.post("/api/v1/hotel/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+    async def hotel_logout(response: Response) -> Response:
+        response.delete_cookie("hoa_ops_session")
+        return response
+
+    def require_hotel_role(principal: HotelPrincipal, *roles: str) -> None:
+        if principal.role not in roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient hotel role"
+            )
+
+    async def hotel_request_for_principal(
+        request_id: UUID,
+        principal: HotelPrincipal,
+        session: AsyncSession,
+    ) -> HotelRequestRecord:
+        record = await session.scalar(
+            select(HotelRequestRecord).where(
+                HotelRequestRecord.id == request_id,
+                HotelRequestRecord.hotel_id == principal.hotel_id,
+            )
+        )
+        if not record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Hotel request not found"
+            )
+        return record
+
+    @app.post(
+        "/api/v1/hotel/conversations",
+        response_model=HotelStartConversationResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def hotel_start_conversation(
+        body: HotelStartConversationRequest,
+        request: Request,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> HotelStartConversationResponse:
+        service = HotelConversationService(
+            session,
+            body.hotel_id,
+            messaging=request.app.state.messaging,
+            notification_channel=app_settings.vendor_notification_channel,
+            interpreter=request.app.state.hotel_interpreter,
+            allow_legacy_language_rules=app_settings.app_env == "test",
+            notification_queue=(
+                OutboxNotificationQueue(session) if app_settings.outbox_enabled else None
+            ),
+            audit_log=hotel_audit_log,
+        )
+        try:
+            conversation_id, say = await service.start(body.caller_phone)
+        except HotelConversationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Hotel not found") from exc
+        return HotelStartConversationResponse(
+            conversation_id=conversation_id, hotel_id=body.hotel_id, say=say
+        )
+
+    @app.post(
+        "/api/v1/hotel/conversations/{conversation_id}/turns",
+        response_model=HotelConversationTurnResponse,
+    )
+    async def hotel_submit_turn(
+        conversation_id: UUID,
+        body: ConversationTurnRequest,
+        request: Request,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> HotelConversationTurnResponse:
+        conversation = await session.get(HotelConversationRecord, conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Hotel conversation not found")
+        service = HotelConversationService(
+            session,
+            conversation.hotel_id,
+            messaging=request.app.state.messaging,
+            notification_channel=app_settings.vendor_notification_channel,
+            interpreter=request.app.state.hotel_interpreter,
+            allow_legacy_language_rules=app_settings.app_env == "test",
+            notification_queue=(
+                OutboxNotificationQueue(session) if app_settings.outbox_enabled else None
+            ),
+        )
+        try:
+            result = await service.handle_turn(conversation_id, body.text)
+        except HotelConversationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Hotel conversation not found") from exc
+        return HotelConversationTurnResponse(
+            conversation_id=result.conversation_id,
+            intent=result.intent,
+            say=result.say,
+            request_id=result.request_id,
+        )
+
+    @app.get("/api/v1/console/hotel/me")
+    async def hotel_console_me(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        hotel = await session.get(HotelRecord, principal.hotel_id)
+        return {
+            "id": str(principal.user_id),
+            "display_name": principal.display_name,
+            "email": principal.email,
+            "role": principal.role,
+            "organization_id": str(principal.organization_id),
+            "hotel_id": str(principal.hotel_id),
+            "hotel_name": hotel.name if hotel else "Hotel",
+        }
+
+    @app.get("/api/v1/console/hotel/dashboard")
+    async def hotel_console_dashboard(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        requests = list(
+            await session.scalars(
+                select(HotelRequestRecord)
+                .where(HotelRequestRecord.hotel_id == principal.hotel_id)
+                .order_by(HotelRequestRecord.created_at.desc())
+            )
+        )
+        active = [row for row in requests if row.status not in {"resolved", "cancelled"}]
+        return {
+            "kpis": {
+                "active_urgent": sum(row.priority in {"urgent", "emergency"} for row in active),
+                "unassigned_requests": sum(row.assigned_to is None for row in active),
+                "open_requests": len(active),
+                "calls_today": await session.scalar(
+                    select(func.count())
+                    .select_from(HotelConversationRecord)
+                    .where(
+                        HotelConversationRecord.hotel_id == principal.hotel_id,
+                        HotelConversationRecord.created_at
+                        >= datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0),
+                    )
+                )
+                or 0,
+                "in_house_guests": await session.scalar(
+                    select(func.count())
+                    .select_from(HotelReservationRecord)
+                    .where(
+                        HotelReservationRecord.hotel_id == principal.hotel_id,
+                        HotelReservationRecord.status == "checked_in",
+                    )
+                )
+                or 0,
+            },
+            "priority_queue": [
+                {
+                    "id": str(row.id),
+                    "category": row.category,
+                    "priority": row.priority,
+                    "description": row.description,
+                    "room_number": row.room_number,
+                    "status": row.status,
+                    "assigned_to": row.assigned_to,
+                    "created_at": row.created_at,
+                }
+                for row in sorted(
+                    active,
+                    key=lambda item: (
+                        item.priority != "emergency",
+                        item.priority != "urgent",
+                        item.created_at,
+                    ),
+                )[:10]
+            ],
+        }
+
+    @app.get("/api/v1/console/hotel/requests")
+    async def hotel_console_requests(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        departments = {
+            row.id: row.name
+            for row in await session.scalars(
+                select(HotelDepartmentRecord).where(
+                    HotelDepartmentRecord.hotel_id == principal.hotel_id
+                )
+            )
+        }
+        rows = await session.scalars(
+            select(HotelRequestRecord)
+            .where(HotelRequestRecord.hotel_id == principal.hotel_id)
+            .order_by(HotelRequestRecord.created_at.desc())
+        )
+        return [
+            {
+                "id": str(row.id),
+                "category": row.category,
+                "priority": row.priority,
+                "description": row.description,
+                "room_number": row.room_number,
+                "department": departments.get(row.department_id),
+                "status": row.status,
+                "assigned_to": row.assigned_to,
+                "notification_status": row.notification_status,
+                "created_at": row.created_at,
+                "acknowledged_at": row.acknowledged_at,
+                "resolved_at": row.resolved_at,
+            }
+            for row in rows
+        ]
+
+    @app.get("/api/v1/console/hotel/requests/{request_id}")
+    async def hotel_console_request_detail(
+        request_id: UUID,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        request = await hotel_request_for_principal(request_id, principal, session)
+        department = (
+            await session.get(HotelDepartmentRecord, request.department_id)
+            if request.department_id
+            else None
+        )
+        conversation = await session.get(HotelConversationRecord, request.conversation_id)
+        turns = list(
+            await session.scalars(
+                select(HotelConversationTurnRecord)
+                .where(HotelConversationTurnRecord.conversation_id == request.conversation_id)
+                .order_by(HotelConversationTurnRecord.created_at)
+            )
+        )
+        actions = list(
+            await session.scalars(
+                select(HotelRequestActionRecord)
+                .where(HotelRequestActionRecord.request_id == request.id)
+                .order_by(HotelRequestActionRecord.created_at)
+            )
+        )
+        guest = await session.get(HotelGuestRecord, request.guest_id) if request.guest_id else None
+        return {
+            "id": str(request.id),
+            "category": request.category,
+            "priority": request.priority,
+            "description": request.description,
+            "room_number": request.room_number,
+            "department": department.name if department else None,
+            "status": request.status,
+            "assigned_to": request.assigned_to,
+            "notification_status": request.notification_status,
+            "acknowledged_at": request.acknowledged_at,
+            "resolved_at": request.resolved_at,
+            "resolution_note": request.resolution_note,
+            "caller": {
+                "name": guest.full_name
+                if guest
+                else conversation.caller_name
+                if conversation
+                else None,
+                "phone": conversation.caller_phone if conversation else None,
+            },
+            "transcript": [
+                {"speaker": turn.speaker, "text": turn.text, "created_at": turn.created_at}
+                for turn in turns
+            ],
+            "timeline": [
+                {
+                    "type": action.action_type,
+                    "detail": action.detail,
+                    "created_at": action.created_at,
+                }
+                for action in actions
+            ],
+        }
+
+    @app.post("/api/v1/console/hotel/requests/{request_id}/acknowledge")
+    async def hotel_acknowledge_request(
+        request_id: UUID,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin", "hotel_responder")
+        request = await hotel_request_for_principal(request_id, principal, session)
+        request.status = "acknowledged"
+        request.acknowledged_at = request.acknowledged_at or datetime.now(UTC)
+        await HotelConversationService(session, principal.hotel_id).store.apply_request_action(
+            request, principal.display_name, "acknowledged", "Staff acknowledged the request."
+        )
+        await session.commit()
+        return {"id": str(request.id), "status": request.status}
+
+    @app.post("/api/v1/console/hotel/requests/{request_id}/assign")
+    async def hotel_assign_request(
+        request_id: UUID,
+        assigned_to: str,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        request = await hotel_request_for_principal(request_id, principal, session)
+        request.assigned_to = assigned_to
+        request.status = "assigned"
+        await HotelConversationService(session, principal.hotel_id).store.apply_request_action(
+            request, principal.display_name, "assigned", f"Assigned to {assigned_to}."
+        )
+        await session.commit()
+        return {"id": str(request.id), "status": request.status, "assigned_to": assigned_to}
+
+    @app.post("/api/v1/console/hotel/requests/{request_id}/resolve")
+    async def hotel_resolve_request(
+        request_id: UUID,
+        body: CaseResolveRequest,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin", "hotel_responder")
+        request = await hotel_request_for_principal(request_id, principal, session)
+        request.status = "resolved"
+        request.resolved_at = datetime.now(UTC)
+        request.resolution_note = body.resolution_note
+        await HotelConversationService(session, principal.hotel_id).store.apply_request_action(
+            request, principal.display_name, "resolved", body.resolution_note
+        )
+        await session.commit()
+        return {"id": str(request.id), "status": request.status}
+
+    @app.get("/api/v1/console/hotel/calls")
+    async def hotel_console_calls(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        conversations = await session.scalars(
+            select(HotelConversationRecord)
+            .where(HotelConversationRecord.hotel_id == principal.hotel_id)
+            .order_by(HotelConversationRecord.created_at.desc())
+        )
+        output = []
+        for conversation in conversations:
+            latest = await session.scalar(
+                select(HotelRequestRecord)
+                .where(HotelRequestRecord.conversation_id == conversation.id)
+                .order_by(HotelRequestRecord.created_at.desc())
+            )
+            output.append(
+                {
+                    "id": str(conversation.id),
+                    "caller_name": conversation.caller_name,
+                    "caller_phone": conversation.caller_phone,
+                    "room_number": conversation.room_number,
+                    "verification_status": conversation.verification_status,
+                    "created_at": conversation.created_at,
+                    "request_id": str(latest.id) if latest else None,
+                    "request_status": latest.status if latest else None,
+                }
+            )
+        return output
+
+    @app.get("/api/v1/console/hotel/reservations")
+    async def hotel_console_reservations(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(HotelReservationRecord)
+            .where(HotelReservationRecord.hotel_id == principal.hotel_id)
+            .order_by(HotelReservationRecord.check_in.desc())
+        )
+        output = []
+        for row in rows:
+            guest = await session.get(HotelGuestRecord, row.guest_id) if row.guest_id else None
+            room = await session.get(HotelRoomRecord, row.room_id) if row.room_id else None
+            lines = list(
+                await session.scalars(
+                    select(HotelReservationRoomRecord)
+                    .where(HotelReservationRoomRecord.reservation_id == row.id)
+                    .order_by(HotelReservationRoomRecord.id)
+                )
+            )
+            output.append(
+                {
+                    "id": str(row.id),
+                    "confirmation_code": row.confirmation_code,
+                    "guest_name": guest.full_name if guest else None,
+                    "phone": guest.phone if guest else None,
+                    "room_number": room.room_number if room else None,
+                    "room_type": room.room_type if room else None,
+                    "check_in": row.check_in,
+                    "check_out": row.check_out,
+                    "status": row.status,
+                    "payment_status": row.payment_status,
+                    "hold_expires_at": row.hold_expires_at,
+                    "nightly_total_cents": row.nightly_total_cents,
+                    "rooms": [
+                        {
+                            "room_id": str(line.room_id),
+                            "room_type": line.room_type,
+                            "guest_count": line.guest_count,
+                            "nightly_rate_cents": line.nightly_rate_cents,
+                        }
+                        for line in lines
+                    ],
+                }
+            )
+        return output
+
+    @app.get("/api/v1/console/hotel/availability")
+    async def hotel_availability(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+        room_type: str | None = None,
+        check_in: date | None = None,
+        check_out: date | None = None,
+    ) -> list[dict]:
+        try:
+            return await HotelPMSAdapter(session, principal.hotel_id).search_availability(
+                room_type, check_in=check_in, check_out=check_out
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/console/hotel/reservations", status_code=status.HTTP_201_CREATED)
+    async def hotel_create_reservation(
+        body: HotelReservationCreateRequest,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        if body.hotel_id != principal.hotel_id:
+            raise HTTPException(status_code=403, detail="Hotel access denied")
+        if body.check_out <= body.check_in:
+            raise HTTPException(status_code=422, detail="Check-out must be after check-in")
+        try:
+            result = await HotelPMSAdapter(session, principal.hotel_id).create_demo_reservation(
+                guest_name=body.guest_name,
+                phone=body.phone,
+                check_in=body.check_in,
+                check_out=body.check_out,
+                room_type=body.room_type,
+                guest_count=body.guest_count,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return result
+
+    @app.patch("/api/v1/console/hotel/reservations/{reservation_id}")
+    async def hotel_modify_reservation(
+        reservation_id: UUID,
+        body: HotelReservationUpdateRequest,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        if body.check_in and body.check_out and body.check_out <= body.check_in:
+            raise HTTPException(status_code=422, detail="Check-out must be after check-in")
+        try:
+            return await HotelPMSAdapter(session, principal.hotel_id).modify_demo_reservation(
+                reservation_id,
+                check_in=body.check_in,
+                check_out=body.check_out,
+                room_type=body.room_type,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/console/hotel/reservations/{reservation_id}/cancel")
+    async def hotel_cancel_reservation(
+        reservation_id: UUID,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        try:
+            await HotelPMSAdapter(session, principal.hotel_id).cancel_demo_reservation(
+                reservation_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"id": str(reservation_id), "status": "cancelled"}
+
+    @app.get("/api/v1/console/hotel/knowledge")
+    async def hotel_console_knowledge(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(HotelKnowledgeRecord)
+            .where(HotelKnowledgeRecord.hotel_id == principal.hotel_id)
+            .order_by(HotelKnowledgeRecord.category, HotelKnowledgeRecord.topic)
+        )
+        return [
+            {
+                "id": str(row.id),
+                "category": row.category,
+                "topic": row.topic,
+                "answer": row.answer,
+                "source_reference": row.source_reference,
+                "approval_status": row.approval_status,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+
+    @app.post("/api/v1/console/hotel/knowledge")
+    async def hotel_upsert_knowledge(
+        body: KnowledgeUpsertRequest,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        record = await session.scalar(
+            select(HotelKnowledgeRecord).where(
+                HotelKnowledgeRecord.hotel_id == principal.hotel_id,
+                HotelKnowledgeRecord.topic == body.topic,
+            )
+        )
+        if not record:
+            record = HotelKnowledgeRecord(
+                hotel_id=principal.hotel_id,
+                category=body.category,
+                topic=body.topic,
+                answer=body.answer,
+            )
+            session.add(record)
+            action = "created"
+        else:
+            record.category = body.category
+            record.answer = body.answer
+            action = "updated"
+        record.source_reference = body.source_reference
+        record.approval_status = body.approval_status
+        record.is_active = body.approval_status == "approved"
+        await session.commit()
+        return {"id": str(record.id), "approval_status": record.approval_status, "action": action}
+
+    @app.get("/api/v1/console/hotel/menu")
+    async def hotel_console_menu(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[dict]:
+        rows = await session.scalars(
+            select(HotelMenuItemRecord)
+            .where(HotelMenuItemRecord.hotel_id == principal.hotel_id)
+            .order_by(HotelMenuItemRecord.category, HotelMenuItemRecord.name)
+        )
+        return [
+            {
+                "id": str(row.id),
+                "category": row.category,
+                "name": row.name,
+                "aliases": json.loads(row.aliases) if row.aliases else [],
+                "description": row.description,
+                "price_cents": row.price_cents,
+                "is_available": row.is_available,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+
+    @app.post("/api/v1/console/hotel/menu", status_code=status.HTTP_201_CREATED)
+    async def hotel_create_menu_item(
+        body: HotelMenuItemCreateRequest,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        name = body.name.strip()
+        existing = await session.scalar(
+            select(HotelMenuItemRecord).where(
+                HotelMenuItemRecord.hotel_id == principal.hotel_id,
+                func.lower(HotelMenuItemRecord.name) == name.casefold(),
+            )
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail="A menu item with this name already exists")
+        row = HotelMenuItemRecord(
+            hotel_id=principal.hotel_id,
+            category=body.category.strip(),
+            name=name,
+            aliases=json.dumps(sorted({alias.strip() for alias in body.aliases if alias.strip()})),
+            description=body.description.strip() if body.description else None,
+            price_cents=body.price_cents,
+            is_available=body.is_available,
+        )
+        session.add(row)
+        await session.commit()
+        return {"id": str(row.id), "name": row.name, "is_available": row.is_available}
+
+    @app.patch("/api/v1/console/hotel/menu/{item_id}")
+    async def hotel_update_menu_item(
+        item_id: UUID,
+        body: HotelMenuItemUpdateRequest,
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        require_hotel_role(principal, "hotel_manager", "hotel_admin")
+        row = await session.scalar(
+            select(HotelMenuItemRecord).where(
+                HotelMenuItemRecord.id == item_id,
+                HotelMenuItemRecord.hotel_id == principal.hotel_id,
+            )
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Menu item not found")
+        if body.name is not None:
+            name = body.name.strip()
+            duplicate = await session.scalar(
+                select(HotelMenuItemRecord).where(
+                    HotelMenuItemRecord.hotel_id == principal.hotel_id,
+                    func.lower(HotelMenuItemRecord.name) == name.casefold(),
+                    HotelMenuItemRecord.id != row.id,
+                )
+            )
+            if duplicate:
+                raise HTTPException(status_code=409, detail="A menu item with this name already exists")
+            row.name = name
+        if body.category is not None:
+            row.category = body.category.strip()
+        if body.aliases is not None:
+            row.aliases = json.dumps(
+                sorted({alias.strip() for alias in body.aliases if alias.strip()})
+            )
+        if body.description is not None:
+            row.description = body.description.strip() or None
+        if body.price_cents is not None:
+            row.price_cents = body.price_cents
+        if body.is_available is not None:
+            row.is_available = body.is_available
+        await session.commit()
+        return {"id": str(row.id), "name": row.name, "is_available": row.is_available}
+
+    @app.get("/api/v1/console/hotel/settings")
+    async def hotel_console_settings(
+        principal: Annotated[HotelPrincipal, Depends(get_hotel_principal)],
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> dict:
+        hotel = await session.get(HotelRecord, principal.hotel_id)
+        departments = await session.scalars(
+            select(HotelDepartmentRecord)
+            .where(
+                HotelDepartmentRecord.hotel_id == principal.hotel_id,
+                HotelDepartmentRecord.is_active.is_(True),
+            )
+            .order_by(HotelDepartmentRecord.name)
+        )
+        return {
+            "hotel": {
+                "id": str(hotel.id),
+                "name": hotel.name,
+                "phone": hotel.phone,
+                "timezone": hotel.timezone,
+                "emergency_policy_summary": hotel.emergency_policy_summary,
+            }
+            if hotel
+            else None,
+            "departments": [
+                {
+                    "id": str(row.id),
+                    "key": row.key,
+                    "name": row.name,
+                    "escalation_phone": row.escalation_phone,
+                }
+                for row in departments
+            ],
+        }
 
     @app.get("/api/v1/console/me")
     async def console_me(
@@ -987,9 +1817,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         row.quote_amount_cents = body.amount_cents
         row.quote_status = body.status
         row.quote_approver = (
-            body.approver or principal.display_name
-            if body.status == "approved"
-            else body.approver
+            body.approver or principal.display_name if body.status == "approved" else body.approver
         )
         await session.commit()
         await record_case_action(
@@ -1042,10 +1870,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         )
         vendor_registry = await session.scalars(
-            select(VendorRecord).where(
+            select(VendorRecord)
+            .where(
                 VendorRecord.management_company_id == principal.management_company_id,
                 VendorRecord.is_active.is_(True),
-            ).order_by(VendorRecord.name)
+            )
+            .order_by(VendorRecord.name)
         )
         return {
             "contacts": [
@@ -1084,9 +1914,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session: Annotated[AsyncSession, Depends(get_session)],
     ) -> list[dict]:
         rows = await session.scalars(
-            select(VendorRecord).where(
-                VendorRecord.management_company_id == principal.management_company_id
-            ).order_by(VendorRecord.name)
+            select(VendorRecord)
+            .where(VendorRecord.management_company_id == principal.management_company_id)
+            .order_by(VendorRecord.name)
         )
         return [
             {"id": str(row.id), "name": row.name, "phone": row.phone, "is_active": row.is_active}
@@ -1365,6 +2195,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             or 0
         )
+        metric_query = (
+            select(VoiceMetricRecord.metric_name, func.avg(VoiceMetricRecord.value_ms))
+            .join(
+                ConversationRecord,
+                ConversationRecord.id == VoiceMetricRecord.conversation_id,
+            )
+            .where(
+                ConversationRecord.management_company_id == principal.management_company_id,
+                VoiceMetricRecord.value_ms.is_not(None),
+            )
+            .group_by(VoiceMetricRecord.metric_name)
+        )
+        metric_averages = {
+            name: round(float(value))
+            for name, value in (await session.execute(metric_query)).all()
+            if value is not None
+        }
         return {
             "call_volume": await session.scalar(
                 select(func.count())
@@ -1379,6 +2226,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "average_resolution_seconds": average_seconds(resolution),
             "automation_failures": failures,
             "open_cases": sum(row.status != "resolved" for row in cases),
+            "voice_metrics_ms": metric_averages,
         }
 
     @app.get("/api/v1/operations/summary")

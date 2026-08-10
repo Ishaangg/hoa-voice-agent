@@ -351,3 +351,59 @@ class KnowledgeRevisionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
+
+
+class OutboxEventRecord(Base):
+    """Durable side-effect intent written in the same transaction as a case.
+
+    External providers are deliberately contacted by the outbox worker, never
+    from the voice turn transaction. This makes a database commit and a
+    WhatsApp/SMS attempt recoverable as one workflow instead of two unrelated
+    operations.
+    """
+
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_outbox_idempotency_key"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    aggregate_type: Mapped[str] = mapped_column(String(64), index=True)
+    aggregate_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class VoiceMetricRecord(Base):
+    """Per-call operational telemetry persisted outside the audio pipeline."""
+
+    __tablename__ = "voice_metrics"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    call_id: Mapped[str] = mapped_column(String(120), index=True)
+    conversation_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True, index=True)
+    domain: Mapped[str] = mapped_column(String(32), index=True)
+    metric_name: Mapped[str] = mapped_column(String(80), index=True)
+    value_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
+    )

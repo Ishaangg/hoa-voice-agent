@@ -7,6 +7,16 @@ import hashlib
 import hmac
 from collections.abc import Mapping
 from html import escape
+from urllib.parse import parse_qs
+
+
+def parse_twilio_form(raw_body: str) -> dict[str, str]:
+    """Parse Twilio form data without dropping empty signed parameters."""
+
+    return {
+        key: values[-1]
+        for key, values in parse_qs(raw_body, keep_blank_values=True).items()
+    }
 
 
 def is_valid_twilio_request(

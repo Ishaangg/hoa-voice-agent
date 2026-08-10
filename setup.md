@@ -16,8 +16,9 @@ connects a Twilio phone number so people can call it.
 
 - Python 3.12 or 3.13.
 - Node.js 20 or newer (for the staff Operations Console build).
-- A NVIDIA API key for the hosted LLM service.
-- A Cartesia API key for streaming voice output.
+- A Groq API key for the hosted Qwen LLM service.
+- A Fish Audio API key and voice reference ID for the default low-latency voice output.
+- Optional: a Cartesia API key if you want the fallback TTS provider.
 - Optional: a Twilio account and Voice-capable phone number for real calls.
 - Optional: [ngrok](https://ngrok.com/) or another public HTTPS/WSS tunnel for local Twilio testing.
 
@@ -51,37 +52,53 @@ Minimum browser-voice configuration:
 
 ```env
 DATABASE_URL=sqlite+aiosqlite:///./hoa_voice_agent.db
-NVIDIA_API_KEY=replace-with-your-key
-VOICE_STT_PROVIDER=deepgram
+GROQ_API_KEY=replace-with-your-key
+GROQ_LLM_BASE_URL=https://api.groq.com/openai/v1
+GROQ_LLM_MODEL=qwen/qwen3.6-27b
+VOICE_STT_PROVIDER=deepgram_flux
 DEEPGRAM_API_KEY=replace-with-your-key
-DEEPGRAM_STT_MODEL=nova-3
-# Use `multi` for Hindi-English callers; set `hi` for a Hindi-only line.
-DEEPGRAM_STT_LANGUAGE=multi
-CARTESIA_API_KEY=replace-with-your-key
-CARTESIA_TTS_MODEL=sonic-3.5
-CARTESIA_TTS_ENGLISH_VOICE=9626c31c-bec5-4cca-baa8-f8ba9e84c8bc
-# Arushi is a professional Hinglish voice from Cartesia's voice library.
-CARTESIA_TTS_HINDI_VOICE=95d51f79-c397-46f9-b49a-23763d3eaa2d
-CARTESIA_TTS_SPEED=1.0
-CARTESIA_TTS_EMOTION=calm
-# Stream LLM text into Cartesia's WebSocket as it arrives.
-CARTESIA_TTS_TEXT_MODE=token
-# Small provider-side buffer to avoid one-token audio artifacts.
-CARTESIA_TTS_MAX_BUFFER_DELAY_MS=250
-# Choose the spoken language before starting a voice session. It remains fixed
-# throughout the call; a transcript can never change the TTS voice.
-VOICE_DEFAULT_LANGUAGE=en
-VOICE_TURN_STOP_SECS=0.45
+# These Nova settings are retained for the explicit `VOICE_STT_PROVIDER=deepgram` fallback.
+DEEPGRAM_FLUX_STT_MODEL=flux-general-multi
+DEEPGRAM_FLUX_LANGUAGE_HINTS=["en","hi"]
+VOICE_TTS_PROVIDER=fish
+FISH_API_KEY=replace-with-your-fish-key
+FISH_TTS_MODEL=s2.1-pro-free
+FISH_TTS_REFERENCE_ID=replace-with-your-fish-voice-id
+FISH_TTS_LATENCY=low
+FISH_TTS_CHUNK_LENGTH=100
+FISH_TTS_MIN_CHUNK_LENGTH=0
+FISH_TTS_CONDITION_ON_PREVIOUS_CHUNKS=false
+FISH_TTS_PRECONNECT=true
+FISH_TTS_SAMPLE_RATE=24000
+FISH_TTS_SPEED=1.08
+FISH_TTS_STYLE=warm, conversational
+# Choose the complete voice pipeline before starting a voice session.
+# Supported values: en, hi, hinglish.
+VOICE_DEFAULT_LANGUAGE=hinglish
+# Optional outbound room tone; keep it low so it never competes with speech.
+VOICE_AMBIENT_ENABLED=true
+VOICE_AMBIENT_VOLUME=0.4
+# Smart Turn uses audio plus transcript context instead of a fixed silence timeout.
+VOICE_USE_SMART_TURN=true
+VOICE_SMART_TURN_STOP_SECS=0.55
+VOICE_SMART_TURN_CPU_COUNT=1
+VOICE_USE_INTERRUPTION_GATE=true
+VOICE_INTERRUPT_MIN_WORDS=2
+VOICE_VAD_STOP_SECS=0.2
+VOICE_TURN_STOP_SECS=0.65
+VOICE_INTERIM_TRANSCRIPT_FALLBACK_SECS=0.55
 VOICE_LLM_MAX_TOKENS=32
 ```
 
 Deepgram provides the real-time speech-to-text service, so voice recognition does not use your
-local GPU, CUDA, or a downloaded Whisper model. Cartesia provides the streaming speech output;
-the LLM still requires `NVIDIA_API_KEY` unless you configure a different LLM provider.
+local GPU, CUDA, or a downloaded Whisper model. Fish provides the streaming speech output;
+the LLM requires `GROQ_API_KEY`; Qwen is the configured model. NVIDIA is only an
+optional legacy STT provider when `VOICE_STT_PROVIDER=nvidia`. Cartesia remains available by
+setting `VOICE_TTS_PROVIDER=cartesia` and providing its credentials.
 
-To start a Hindi call, set `VOICE_DEFAULT_LANGUAGE=hi` and restart the voice runtime before
-the caller connects. To return to English, set it back to `en` before the next session. The
-language is intentionally fixed for a live call to keep voice output stable.
+To start a Hinglish call, set `VOICE_DEFAULT_LANGUAGE=hinglish` and restart the voice runtime
+before the caller connects. Use `hi` for Hindi or `en` for English. The language adapter keeps
+the selected mode fixed for the entire live call.
 
 Never commit `.env`. It contains API and Twilio credentials.
 
@@ -124,6 +141,37 @@ These accounts seed an Evergreen Community Management tenant with Pine Grove Com
 They are demo credentials only; provision real staff identities and
 replace SQLite before a production deployment.
 
+## Production persistence and workers
+
+Production uses PostgreSQL and explicit Alembic migrations. Do not allow the API
+or voice process to create tables at startup:
+
+```powershell
+$env:DATABASE_URL = "postgresql+asyncpg://hoa:password@postgres/hoa_voice_agent"
+$env:DATABASE_AUTO_CREATE = "false"
+alembic upgrade head
+```
+
+Run the notification outbox separately so database commits and WhatsApp/SMS
+delivery cannot diverge:
+
+```powershell
+$env:OUTBOX_ENABLED = "true"
+python -m hoa_voice_agent.voice.outbox_worker
+```
+
+Run the Pipecat media worker in another process/container:
+
+```powershell
+python -m hoa_voice_agent.voice.production_worker -t twilio --host 0.0.0.0
+```
+
+The media worker is deliberately independent from the API and outbox. In a
+managed deployment, put multiple media-worker replicas behind the telephony
+ingress or use Pipecat Cloud's dispatcher. Set `VOICE_ENABLE_TRACING=true` when
+the OpenTelemetry exporter is configured. Per-call metrics are stored in
+`voice_metrics` and surfaced through console analytics.
+
 ## 4. Test the voice agent in a browser
 
 In a second terminal:
@@ -134,6 +182,18 @@ python -m hoa_voice_agent.voice.bot -t webrtc
 ```
 
 Open `http://localhost:7860/client/`, allow microphone access, then click **Connect**.
+
+The active profile is now Deepgram Flux. To return to the Nova pipeline, set these
+values in `.env` before restarting the process:
+
+```env
+VOICE_STT_PROVIDER=deepgram
+DEEPGRAM_STT_MODEL=nova-3
+DEEPGRAM_STT_LANGUAGE=multi
+```
+
+Flux supplies its own turn events, so the application automatically bypasses the
+Nova-only local VAD and Deepgram finalization processors for this profile.
 
 The Playground is a development test page. If it becomes stuck after Disconnect, refresh the
 page before making another browser test session. Real phone calls do not use this page.

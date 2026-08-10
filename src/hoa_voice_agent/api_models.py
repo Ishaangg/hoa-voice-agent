@@ -1,3 +1,4 @@
+from datetime import date
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -106,3 +107,55 @@ class BillingRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     service: str
+
+
+class HotelStartConversationRequest(BaseModel):
+    caller_phone: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    hotel_id: UUID
+
+
+class HotelStartConversationResponse(BaseModel):
+    conversation_id: UUID
+    hotel_id: UUID
+    say: str
+
+
+class HotelConversationTurnResponse(BaseModel):
+    conversation_id: UUID
+    intent: str
+    say: str
+    request_id: UUID | None = None
+
+
+class HotelReservationCreateRequest(BaseModel):
+    hotel_id: UUID
+    guest_name: str = Field(min_length=2, max_length=160)
+    phone: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    check_in: date
+    check_out: date
+    room_type: str = Field(default="standard", min_length=2, max_length=64)
+    guest_count: int = Field(default=1, ge=1, le=12)
+
+
+class HotelReservationUpdateRequest(BaseModel):
+    check_in: date | None = None
+    check_out: date | None = None
+    room_type: str | None = Field(default=None, min_length=2, max_length=64)
+
+
+class HotelMenuItemCreateRequest(BaseModel):
+    category: str = Field(default="Menu", min_length=2, max_length=64)
+    name: str = Field(min_length=2, max_length=160)
+    aliases: list[str] = Field(default_factory=list, max_length=20)
+    description: str | None = Field(default=None, max_length=1_000)
+    price_cents: int | None = Field(default=None, ge=0)
+    is_available: bool = True
+
+
+class HotelMenuItemUpdateRequest(BaseModel):
+    category: str | None = Field(default=None, min_length=2, max_length=64)
+    name: str | None = Field(default=None, min_length=2, max_length=160)
+    aliases: list[str] | None = Field(default=None, max_length=20)
+    description: str | None = Field(default=None, max_length=1_000)
+    price_cents: int | None = Field(default=None, ge=0)
+    is_available: bool | None = None

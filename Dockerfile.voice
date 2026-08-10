@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+# The media worker needs Pipecat transports and provider adapters; the API and
+# outbox images remain lightweight and use the base Dockerfile.
+RUN pip install --no-cache-dir ".[voice]"
+
+EXPOSE 7860
+
+CMD ["python", "-m", "hoa_voice_agent.voice.production_worker", "-t", "twilio", "--host", "0.0.0.0"]

@@ -5,11 +5,14 @@ The Pipecat development runner then serves a browser client at
 ``http://localhost:7860/client``.
 """
 
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
 from contextlib import suppress
+from uuid import UUID
 
 from fastapi import HTTPException, Request
 from fastapi.responses import Response
@@ -17,6 +20,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -31,13 +35,20 @@ from pipecat.runner.types import (
     WebSocketRunnerArguments,
 )
 from pipecat.services.cartesia.tts import CartesiaTTSService, GenerationConfig
-from pipecat.services.nvidia.llm import NvidiaLLMService
 from pipecat.services.nvidia.stt import NvidiaSTTService
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.tts_service import TextAggregationMode
+from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_stop import (
+    SpeechTimeoutUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import (
+    ExternalUserTurnStrategies,
+    UserTurnStrategies,
+)
 
 from hoa_voice_agent.adapters.fake import (
     COMMUNITY_ID,
@@ -46,22 +57,41 @@ from hoa_voice_agent.adapters.fake import (
     FakeMessagingAdapter,
 )
 from hoa_voice_agent.adapters.twilio import TwilioMessagingAdapter
+from hoa_voice_agent.persistence import hotel_tables as _hotel_tables  # noqa: F401
 from hoa_voice_agent.persistence import tables as _tables  # noqa: F401
 from hoa_voice_agent.persistence.database import Database
-from hoa_voice_agent.persistence.seed import seed_demo_community_knowledge
+from hoa_voice_agent.persistence.seed import seed_demo_community_knowledge, seed_demo_hotel
 from hoa_voice_agent.services.conversation import ConversationService
-from hoa_voice_agent.services.nvidia_incident_extractor import NvidiaIncidentExtractor
-from hoa_voice_agent.voice.language import tts_settings_for_language
+from hoa_voice_agent.services.hotel_audit import HotelConversationAuditLog
+from hoa_voice_agent.services.hotel_conversation import HotelConversationService
+from hoa_voice_agent.services.hotel_turn_interpreter import OpenAIHotelTurnInterpreter
+from hoa_voice_agent.services.openai_incident_extractor import OpenAIIncidentExtractor
+from hoa_voice_agent.services.outbox import OutboxNotificationQueue
+from hoa_voice_agent.services.telemetry import CallTelemetry
+from hoa_voice_agent.voice.ambient_audio import AmbientNoiseMixer
+from hoa_voice_agent.voice.deepgram_finalization import DeepgramFinalizationProcessor
+from hoa_voice_agent.voice.fish_tts import FishAudioTTSService, FishAudioWarmupProcessor
+from hoa_voice_agent.voice.hotel_workflow_processor import HotelWorkflowProcessor
+from hoa_voice_agent.voice.interim_transcript_recovery import (
+    InterimTranscriptRecoveryProcessor,
+)
+from hoa_voice_agent.voice.interruption_gate import GuardedInterruptionUserTurnStartStrategy
+from hoa_voice_agent.voice.language import LanguageAdapter, language_adapter
+from hoa_voice_agent.voice.response_gate import VoiceOutputGateProcessor
 from hoa_voice_agent.voice.settings import VoiceRuntimeSettings
 from hoa_voice_agent.voice.twilio_voice import (
     is_valid_twilio_request,
     is_valid_twilio_websocket_request,
+    parse_twilio_form,
     twiml_for_media_stream,
 )
 from hoa_voice_agent.voice.workflow_processor import HOAWorkflowProcessor
 
 
-def create_stt(settings: VoiceRuntimeSettings):
+def create_stt(
+    settings: VoiceRuntimeSettings,
+    language: LanguageAdapter | None = None,
+):
     if settings.voice_stt_provider == "nvidia":
         return NvidiaSTTService(
             api_key=settings.nvidia_api_key,
@@ -71,6 +101,34 @@ def create_stt(settings: VoiceRuntimeSettings):
                 "function_id": settings.nvidia_stt_function_id,
                 "model_name": settings.nvidia_stt_model,
             },
+        )
+
+    if settings.voice_stt_provider == "deepgram_flux":
+        try:
+            # Pipecat 1.6 exposes Flux from the nested ``flux.stt`` module.
+            from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+        except ImportError as exc:
+            raise RuntimeError(
+                "Deepgram Flux support is not installed in this Pipecat environment."
+            ) from exc
+
+        try:
+            language_hints = [Language(code) for code in settings.deepgram_flux_language_hints]
+        except ValueError as exc:
+            raise ValueError(
+                "DEEPGRAM_FLUX_LANGUAGE_HINTS must contain valid language codes."
+            ) from exc
+
+        return DeepgramFluxSTTService(
+            api_key=settings.deepgram_api_key,
+            settings=DeepgramFluxSTTService.Settings(
+                model=settings.deepgram_flux_stt_model,
+                language_hints=language_hints,
+                eot_threshold=settings.deepgram_flux_eot_threshold,
+                eager_eot_threshold=settings.deepgram_flux_eager_eot_threshold,
+                eot_timeout_ms=settings.deepgram_flux_eot_timeout_ms,
+                keyterm=settings.deepgram_stt_keyterms,
+            ),
         )
 
     try:
@@ -83,12 +141,96 @@ def create_stt(settings: VoiceRuntimeSettings):
         api_key=settings.deepgram_api_key,
         settings=DeepgramSTTService.Settings(
             model=settings.deepgram_stt_model,
-            language=settings.deepgram_stt_language,
+            language=(
+                language.stt_language
+                if language is not None
+                else (settings.deepgram_stt_language or "multi")
+            ),
             interim_results=True,
+            endpointing=settings.deepgram_stt_endpointing_ms,
+            keyterm=settings.deepgram_stt_keyterms,
             numerals=True,
             punctuate=True,
         ),
+        ttfs_p99_latency=settings.deepgram_stt_ttfs_p99_latency,
     )
+
+
+def create_turn_strategies(settings: VoiceRuntimeSettings) -> UserTurnStrategies:
+    """Create end-of-turn detection with a conservative fallback.
+
+    VAD detects that speech stopped; it cannot reliably tell whether the caller
+    finished a thought. Smart Turn uses the audio context around the pause to
+    avoid submitting fragments such as ``"my room..."`` to the workflow. The
+    fixed timeout remains available for environments where the bundled ONNX
+    analyzer cannot initialize.
+    """
+
+    if settings.voice_stt_provider == "deepgram_flux":
+        # Flux emits user-started/user-stopped frames from its model-integrated
+        # turn detector. Local VAD or a timeout would create a second,
+        # competing definition of the caller's turn.
+        return ExternalUserTurnStrategies()
+
+    if settings.voice_use_smart_turn:
+        try:
+            from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+            from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
+                LocalSmartTurnAnalyzerV3,
+            )
+
+            analyzer = LocalSmartTurnAnalyzerV3(
+                cpu_count=settings.voice_smart_turn_cpu_count,
+                params=SmartTurnParams(stop_secs=settings.voice_smart_turn_stop_secs),
+            )
+            logger.info(
+                "Using LocalSmartTurnAnalyzerV3 for end-of-turn detection "
+                "(stop_secs={}, cpu_count={}).",
+                settings.voice_smart_turn_stop_secs,
+                settings.voice_smart_turn_cpu_count,
+            )
+            return UserTurnStrategies(
+                start=(
+                    [
+                        GuardedInterruptionUserTurnStartStrategy(
+                            min_words_while_bot_speaking=settings.voice_interrupt_min_words
+                        )
+                    ]
+                    if settings.voice_use_interruption_gate
+                    else None
+                ),
+                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=analyzer)]
+            )
+        except Exception as exc:  # pragma: no cover - depends on local ONNX runtime
+            logger.warning(
+                "Smart Turn could not initialize; falling back to speech timeout: {}",
+                exc,
+            )
+
+    return UserTurnStrategies(
+        start=(
+            [
+                GuardedInterruptionUserTurnStartStrategy(
+                    min_words_while_bot_speaking=settings.voice_interrupt_min_words
+                )
+            ]
+            if settings.voice_use_interruption_gate
+            else None
+        ),
+        stop=[
+            SpeechTimeoutUserTurnStopStrategy(
+                user_speech_timeout=settings.voice_turn_stop_secs
+            )
+        ]
+    )
+
+
+def create_audio_out_mixer(settings: VoiceRuntimeSettings) -> AmbientNoiseMixer | None:
+    """Create the optional ambient bed for one isolated outbound session."""
+
+    if not settings.voice_ambient_enabled:
+        return None
+    return AmbientNoiseMixer(volume=settings.voice_ambient_volume)
 
 
 async def run_bot(
@@ -100,11 +242,18 @@ async def run_bot(
 ) -> None:
     """Build one isolated resident audio session."""
 
-    database = Database(settings.database_url)
+    database = Database(
+        settings.database_url,
+        auto_create_schema=settings.database_auto_create,
+    )
     await database.create_schema()
     session = database.session_factory()
+    telemetry: CallTelemetry | None = None
+    tts = None
     try:
         await seed_demo_community_knowledge(session)
+        if settings.voice_domain == "hotel":
+            await seed_demo_hotel(session)
         community_management = FakeCommunityManagementAdapter()
         messaging = (
             TwilioMessagingAdapter(
@@ -117,102 +266,253 @@ async def run_bot(
             if settings.sms_mode == "twilio"
             else FakeMessagingAdapter()
         )
-        conversation_service = ConversationService(
-            session=session,
-            community_management=community_management,
-            messaging=messaging,
-            call_control=FakeCallControlAdapter(),
-            vendor_notification_channel=settings.vendor_notification_channel,
-            incident_extractor=NvidiaIncidentExtractor(
-                api_key=settings.nvidia_api_key,
-                base_url=settings.nvidia_llm_base_url,
-                model=settings.nvidia_llm_model,
-                # Known safety phrases are handled locally. This avoids an LLM
-                # round trip before creating an emergency or urgent work order.
-                prefer_local_for_known_incidents=True,
-            ),
+        conversation_service = None
+        hotel_service = None
+        selected_language = (
+            settings.hotel_response_language
+            if settings.voice_domain == "hotel" and settings.hotel_response_language
+            else settings.voice_default_language
         )
-        conversation = await conversation_service.start(
-            caller_phone,
-            COMMUNITY_ID,
-            language=settings.voice_default_language,
-        )
-
-        stt = create_stt(settings)
-        tts_language_settings = tts_settings_for_language(
-            settings.voice_default_language,
+        session_language = language_adapter(
+            selected_language,
             english_voice=settings.cartesia_tts_english_voice,
             hindi_voice=settings.cartesia_tts_hindi_voice,
+            voice_override=settings.cartesia_tts_voice,
+            language_override=settings.cartesia_tts_language,
         )
-        tts = CartesiaTTSService(
-            api_key=settings.cartesia_api_key,
-            settings=CartesiaTTSService.Settings(
-                model=settings.cartesia_tts_model,
-                voice=tts_language_settings["voice"],
-                language=tts_language_settings["language"],
-                generation_config=GenerationConfig(
-                    speed=settings.cartesia_tts_speed,
-                    emotion=settings.cartesia_tts_emotion,
+        if settings.voice_domain == "hotel":
+            hotel_service = HotelConversationService(
+                session=session,
+                hotel_id=UUID(settings.hotel_demo_hotel_id),
+                messaging=messaging,
+                notification_channel=settings.vendor_notification_channel,
+                interpreter=OpenAIHotelTurnInterpreter(
+                    api_key=settings.hotel_llm_api_key,
+                    base_url=settings.hotel_llm_base_url,
+                    model=settings.hotel_llm_model,
+                    reasoning_effort=settings.hotel_llm_reasoning_effort,
                 ),
-            ),
-            text_aggregation_mode=TextAggregationMode(settings.cartesia_tts_text_mode),
-            max_buffer_delay_ms=(
-                settings.cartesia_tts_max_buffer_delay_ms
-                if settings.cartesia_tts_text_mode == "token"
-                else None
-            ),
+                notification_queue=(
+                    OutboxNotificationQueue(session) if settings.outbox_enabled else None
+                ),
+                audit_log=HotelConversationAuditLog(settings.hotel_audit_log_path),
+                language_adapter=session_language,
+            )
+            conversation_id, greeting = await hotel_service.start(caller_phone)
+        else:
+            conversation_service = ConversationService(
+                session=session,
+                community_management=community_management,
+                messaging=messaging,
+                call_control=FakeCallControlAdapter(),
+                vendor_notification_channel=settings.vendor_notification_channel,
+                incident_extractor=OpenAIIncidentExtractor(
+                    api_key=settings.groq_api_key,
+                    base_url=settings.groq_llm_base_url,
+                    model=settings.groq_llm_model,
+                    # The structured LLM router classifies normal resident turns.
+                    # ConversationService still keeps an immediate local path for
+                    # explicit life-safety language and provider failures.
+                    prefer_local_for_known_incidents=False,
+                ),
+                notification_queue=(
+                    OutboxNotificationQueue(session) if settings.outbox_enabled else None
+                ),
+            )
+            conversation = await conversation_service.start(
+                caller_phone,
+                COMMUNITY_ID,
+                language=settings.voice_default_language,
+            )
+            conversation_id, greeting = conversation.conversation_id, conversation.say
+
+        telemetry = CallTelemetry(
+            database,
+            call_id=str(conversation_id),
+            conversation_id=conversation_id,
+            domain=settings.voice_domain,
         )
-        llm = NvidiaLLMService(
-            api_key=settings.nvidia_api_key,
-            base_url=settings.nvidia_llm_base_url,
-            settings=NvidiaLLMService.Settings(
-                model=settings.nvidia_llm_model,
-                temperature=0.2,
-                max_tokens=settings.voice_llm_max_tokens,
-                # The OpenAI SDK forwards provider-specific NVIDIA fields only through
-                # ``extra_body``; passing this at the top level aborts the stream.
-                extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-            ),
-        )
+        telemetry.record("call_started")
+        if hotel_service:
+            # The catalog module records cache and recommendation timings
+            # without coupling service construction to the voice call id.
+            hotel_service.telemetry = telemetry
+            hotel_service.booking_coordinator.telemetry = telemetry
+
+        stt = create_stt(settings, session_language)
+        if settings.voice_tts_provider == "fish":
+            tts = FishAudioTTSService(
+                api_key=settings.fish_api_key,
+                model=settings.fish_tts_model,
+                reference_id=settings.fish_tts_reference_id,
+                sample_rate=settings.fish_tts_sample_rate,
+                latency=settings.fish_tts_latency,
+                chunk_length=settings.fish_tts_chunk_length,
+                min_chunk_length=settings.fish_tts_min_chunk_length,
+                condition_on_previous_chunks=settings.fish_tts_condition_on_previous_chunks,
+                preconnect=settings.fish_tts_preconnect,
+                speed=settings.fish_tts_speed,
+                temperature=settings.fish_tts_temperature,
+                top_p=settings.fish_tts_top_p,
+                style=settings.fish_tts_style,
+                text_aggregation_mode=TextAggregationMode(settings.fish_tts_text_mode),
+            )
+        else:
+            tts_language_settings = session_language.tts_settings
+            tts = CartesiaTTSService(
+                api_key=settings.cartesia_api_key,
+                settings=CartesiaTTSService.Settings(
+                    model=settings.cartesia_tts_model,
+                    voice=tts_language_settings.voice,
+                    language=tts_language_settings.language,
+                    generation_config=GenerationConfig(
+                        speed=settings.cartesia_tts_speed,
+                        emotion=settings.cartesia_tts_emotion,
+                    ),
+                ),
+                text_aggregation_mode=TextAggregationMode(settings.cartesia_tts_text_mode),
+                max_buffer_delay_ms=(
+                    settings.cartesia_tts_max_buffer_delay_ms
+                    if settings.cartesia_tts_text_mode == "token"
+                    else None
+                ),
+            )
+        # Hotel workflow responses already include the hotel interpreter's
+        # semantic call and any read-only PMS tool round trip. Do not place a
+        # second general LLM after the workflow. HOA keeps its existing
+        # streaming LLM path for backwards compatibility.
+        llm = None
+        if not hotel_service:
+            llm = OpenAILLMService(
+                api_key=settings.groq_api_key,
+                base_url=settings.groq_llm_base_url,
+                settings=OpenAILLMService.Settings(
+                    model=settings.groq_llm_model,
+                    temperature=0.2,
+                    max_tokens=settings.voice_llm_max_tokens,
+                    # Luna supports an explicit non-thinking mode through the
+                    # OpenAI-compatible reasoning_effort field.
+                    extra={
+                        "reasoning_effort": "none",
+                        "extra_body": {"reasoning_format": "hidden"},
+                    },
+                ),
+            )
 
         context = LLMContext()
+        uses_flux_turns = settings.voice_stt_provider == "deepgram_flux"
         aggregators = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
-                # Use VAD plus a short speech timeout to commit a transcript reliably.
-                # Smart Turn can hold a browser session open indefinitely when its local
-                # analyzer fails to receive a clean end-of-speech signal.
-                vad_analyzer=SileroVADAnalyzer(
-                    params=VADParams(stop_secs=settings.voice_vad_stop_secs)
-                ),
-                user_turn_strategies=UserTurnStrategies(
-                    stop=[
-                        SpeechTimeoutUserTurnStopStrategy(
-                            user_speech_timeout=settings.voice_turn_stop_secs
+                # Flux emits its own turn events. Nova uses local VAD plus the
+                # configured turn strategy to decide when to submit a turn.
+                vad_analyzer=(
+                    None
+                    if uses_flux_turns
+                    else SileroVADAnalyzer(
+                        params=VADParams(
+                            confidence=settings.voice_vad_confidence,
+                            start_secs=settings.voice_vad_start_secs,
+                            stop_secs=settings.voice_vad_stop_secs,
+                            min_volume=settings.voice_vad_min_volume,
                         )
-                    ]
+                    )
                 ),
+                user_turn_strategies=create_turn_strategies(settings),
             ),
         )
-        workflow = HOAWorkflowProcessor(
-            conversation_service,
-            conversation.conversation_id,
-            settings.voice_default_language,
+        if hotel_service:
+            workflow = HotelWorkflowProcessor(
+                hotel_service,
+                conversation_id,
+                session_language.mode,
+                telemetry=telemetry,
+                language_adapter=session_language,
+            )
+        else:
+            workflow = HOAWorkflowProcessor(
+                conversation_service,
+                conversation_id,
+                session_language.mode,
+                telemetry=telemetry,
+            )
+        deepgram_finalization = (
+            None
+            if uses_flux_turns
+            else DeepgramFinalizationProcessor(telemetry=telemetry)
         )
-        pipeline = Pipeline(
+        transcript_recovery = (
+            None
+            if uses_flux_turns
+            else InterimTranscriptRecoveryProcessor(
+                fallback_delay_secs=settings.voice_interim_transcript_fallback_secs
+            )
+        )
+        pipeline_frames = [
+            transport.input(),
+            stt,
+            aggregators.user(),
+        ]
+        if deepgram_finalization is not None:
+            pipeline_frames.insert(2, deepgram_finalization)
+        if transcript_recovery is not None:
+            pipeline_frames.insert(3, transcript_recovery)
+        if isinstance(tts, FishAudioTTSService):
+            # Start Fish's WebSocket as soon as the caller begins speaking so
+            # its handshake overlaps the caller's utterance and LLM work.
+            pipeline_frames.append(FishAudioWarmupProcessor(tts))
+        pipeline_frames.append(workflow)
+        if llm is not None:
+            pipeline_frames.append(llm)
+        pipeline_frames.extend(
             [
-                transport.input(),
-                stt,
-                aggregators.user(),
-                workflow,
-                llm,
+                VoiceOutputGateProcessor(),
                 tts,
                 transport.output(),
                 aggregators.assistant(),
             ]
         )
+        pipeline = Pipeline(pipeline_frames)
+        latency_observer = UserBotLatencyObserver()
+
+        @latency_observer.event_handler("on_latency_measured")
+        async def on_latency_measured(_observer, latency_seconds: float) -> None:
+            telemetry.record("turn_latency", latency_seconds * 1000)
+
+        @latency_observer.event_handler("on_first_bot_speech_latency")
+        async def on_first_bot_speech_latency(_observer, latency_seconds: float) -> None:
+            telemetry.record("first_audio_latency", latency_seconds * 1000)
+
+        @latency_observer.event_handler("on_latency_breakdown")
+        async def on_latency_breakdown(_observer, breakdown) -> None:
+            if breakdown.user_turn_secs is not None:
+                telemetry.record("user_turn", breakdown.user_turn_secs * 1000)
+            if breakdown.text_aggregation:
+                telemetry.record(
+                    "text_aggregation",
+                    breakdown.text_aggregation.duration_secs * 1000,
+                )
+            for item in breakdown.ttfb:
+                processor = item.processor.lower()
+                metric_name = "service_ttfb"
+                if "stt" in processor:
+                    metric_name = "stt_ttfb"
+                elif "llm" in processor or "openai" in processor or "nvidia" in processor:
+                    metric_name = "llm_ttfb"
+                elif "tts" in processor or "cartesia" in processor or "fish" in processor:
+                    metric_name = "tts_ttfb"
+                telemetry.record(
+                    metric_name,
+                    item.duration_secs * 1000,
+                    metadata={"processor": item.processor, "model": item.model},
+                )
+
         task = PipelineTask(
             pipeline,
+            conversation_id=str(conversation_id),
+            enable_tracing=settings.voice_enable_tracing,
+            additional_span_attributes={"voice.domain": settings.voice_domain},
+            observers=[latency_observer],
             params=PipelineParams(
                 audio_in_sample_rate=16000,
                 audio_out_sample_rate=24000,
@@ -230,9 +530,9 @@ async def run_bot(
             logger.info(
                 "Voice session {} is ready; sending greeting for conversation {}.",
                 task.id,
-                conversation.conversation_id,
+                conversation_id,
             )
-            await task.queue_frames([TTSSpeakFrame(conversation.say)])
+            await task.queue_frames([TTSSpeakFrame(greeting)])
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(_transport, _connection) -> None:
@@ -258,6 +558,17 @@ async def run_bot(
 
         await PipelineRunner(handle_sigint=False).run(task)
     finally:
+        # The runner normally stops processors during task cancellation, but
+        # explicitly close the provider as well. This prevents a reconnect
+        # from retaining an old Fish/Cartesia audio stream and producing mixed
+        # voices in the browser.
+        if tts is not None:
+            with suppress(Exception):
+                await tts.cleanup()
+        if telemetry:
+            telemetry.record("call_finished")
+            with suppress(Exception):
+                await telemetry.close()
         await session.close()
         await database.dispose()
 
@@ -269,7 +580,11 @@ async def bot(runner_args: RunnerArguments) -> None:
     if isinstance(runner_args, SmallWebRTCRunnerArguments):
         transport = SmallWebRTCTransport(
             webrtc_connection=runner_args.webrtc_connection,
-            params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+            params=TransportParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                audio_out_mixer=create_audio_out_mixer(settings),
+            ),
         )
         await run_bot(
             transport,
@@ -289,6 +604,7 @@ async def bot(runner_args: RunnerArguments) -> None:
                 "twilio": lambda: FastAPIWebsocketParams(
                     audio_in_enabled=True,
                     audio_out_enabled=True,
+                    audio_out_mixer=create_audio_out_mixer(settings),
                 )
             },
         )
@@ -344,9 +660,7 @@ def configure_twilio_voice_webhook() -> None:
             raise HTTPException(status_code=503, detail="Twilio Voice is not configured.")
 
         raw_body = (await request.body()).decode("utf-8")
-        from urllib.parse import parse_qs
-
-        form_values = {key: values[-1] for key, values in parse_qs(raw_body).items()}
+        form_values = parse_twilio_form(raw_body)
         if settings.twilio_validate_webhooks and not is_valid_twilio_request(
             auth_token=settings.twilio_auth_token or "",
             url=settings.twilio_voice_webhook_url,

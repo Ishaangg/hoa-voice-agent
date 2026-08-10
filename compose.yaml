@@ -1,9 +1,27 @@
 services:
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://hoa:hoa@postgres:5432/hoa_voice_agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     environment:
-      APP_ENV: development
+      APP_ENV: production
       DATABASE_URL: postgresql+asyncpg://hoa:hoa@postgres:5432/hoa_voice_agent
+      DATABASE_AUTO_CREATE: "false"
+      OUTBOX_ENABLED: "true"
+      SMS_MODE: ${SMS_MODE:-fake}
+      VENDOR_NOTIFICATION_CHANNEL: ${VENDOR_NOTIFICATION_CHANNEL:-whatsapp}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_PHONE: ${TWILIO_FROM_PHONE:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      TWILIO_WHATSAPP_CONTENT_SID: ${TWILIO_WHATSAPP_CONTENT_SID:-}
       REDIS_URL: redis://redis:6379/0
       ENABLE_REDIS: "true"
     ports:
@@ -13,6 +31,51 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  outbox:
+    build: .
+    command: ["python", "-m", "hoa_voice_agent.voice.outbox_worker"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://hoa:hoa@postgres:5432/hoa_voice_agent
+      DATABASE_AUTO_CREATE: "false"
+      OUTBOX_ENABLED: "true"
+      SMS_MODE: ${SMS_MODE:-fake}
+      VENDOR_NOTIFICATION_CHANNEL: ${VENDOR_NOTIFICATION_CHANNEL:-whatsapp}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_PHONE: ${TWILIO_FROM_PHONE:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      TWILIO_WHATSAPP_CONTENT_SID: ${TWILIO_WHATSAPP_CONTENT_SID:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  voice:
+    profiles: ["production"]
+    build:
+      context: .
+      dockerfile: Dockerfile.voice
+    command: ["python", "-m", "hoa_voice_agent.voice.production_worker", "-t", "twilio", "--host", "0.0.0.0"]
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+asyncpg://hoa:hoa@postgres:5432/hoa_voice_agent
+      DATABASE_AUTO_CREATE: "false"
+      OUTBOX_ENABLED: "true"
+      VOICE_ENABLE_TRACING: "true"
+    ports:
+      - "7860:7860"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   postgres:
     image: postgres:16-alpine
@@ -42,4 +105,3 @@ services:
 
 volumes:
   postgres_data:
-
