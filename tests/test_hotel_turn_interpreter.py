@@ -49,6 +49,188 @@ async def test_interpreter_returns_structured_json() -> None:
     assert result.room_number == "204"
 
 
+async def test_groq_llama_request_omits_unsupported_reasoning_effort() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if "reasoning_effort" in payload:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "`reasoning_effort` is not supported with this model"
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"intent":"booking","action":"ask_slot",'
+                                '"booking_guest_count":3,'
+                                '"booking_guest_count_evidence":"teen logon",'
+                                '"confidence":0.99}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    interpreter = OpenAIHotelTurnInterpreter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="llama-3.3-70b-versatile",
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    result = await interpreter.interpret(
+        text="Mujhe teen logon ke liye room chahiye.",
+        last_assistant_turn=None,
+        caller_name=None,
+        room_number=None,
+        pending_category="booking",
+        pending_description=None,
+        active_topic="booking",
+        last_intent="booking",
+    )
+
+    assert result is not None
+    assert result.booking_guest_count == 3
+    assert len(requests) == 1
+    assert "reasoning_effort" not in requests[0]
+    assert requests[0]["response_format"] == {"type": "json_object"}
+
+
+async def test_compact_context_keeps_pending_booking_fact_confirmation() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"intent":"confirmation","action":"confirm",'
+                                '"dialogue_act":"accept","command":"accept_offer"}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    interpreter = OpenAIHotelTurnInterpreter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="qwen/qwen3.6-27b",
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    result = await interpreter.interpret(
+        text="\u0939\u093e\u0902 \u091c\u0940.",
+        last_assistant_turn=(
+            "Bas confirm kar loon, kya main guest count ko 3 guests maan loon?"
+        ),
+        caller_name=None,
+        room_number=None,
+        pending_category="booking",
+        pending_description="guest count confirmation",
+        active_topic="booking",
+        last_intent="booking",
+        booking_guest_count=2,
+        booking_plan_json="{}",
+        booking_pending_fact_confirmation=True,
+    )
+
+    assert result is not None
+    request_context = json.loads(requests[0]["messages"][1]["content"])
+    assert request_context["booking_pending_fact_confirmation"] is True
+
+
+async def test_uncertain_party_answer_gets_one_semantic_repair_attempt() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            content = json.dumps(
+                {
+                    "intent": "unknown",
+                    "action": "none",
+                    "dialogue_act": "unknown",
+                    "command": "unknown",
+                }
+            )
+        else:
+            content = json.dumps(
+                {
+                    "intent": "booking",
+                    "action": "answer",
+                    "dialogue_act": "inform",
+                    "command": "update_facts",
+                    "booking_plan_json": {
+                        "party_composition_known": True,
+                        "party_groups": [],
+                    },
+                }
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": content}}]},
+        )
+
+    interpreter = OpenAIHotelTurnInterpreter(
+        api_key="test-key",
+        base_url="https://api.groq.com/openai/v1",
+        model="qwen/qwen3.6-27b",
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    result = await interpreter.interpret(
+        text=(
+            "\u0928\u0939\u0940\u0902 \u0915\u094b\u0908 \u092d\u0940 couple "
+            "\u0928\u0939\u0940\u0902 \u0939\u0948."
+        ),
+        last_assistant_turn=(
+            "Theek hai, 3 guests hain. Kya group mein couples hain? Agar haan, kitne?"
+        ),
+        caller_name=None,
+        room_number=None,
+        pending_category="booking",
+        pending_description=None,
+        active_topic="booking",
+        last_intent="booking",
+        response_language="hinglish",
+        booking_guest_count=3,
+        booking_plan_json="{}",
+    )
+
+    assert result is not None
+    assert result.intent == "booking"
+    assert result.dialogue_act == "inform"
+    assert result.booking_plan_json is not None
+    assert json.loads(result.booking_plan_json) == {
+        "party_composition_known": True,
+        "party_groups": [],
+    }
+    assert len(requests) == 2
+
+
 async def test_interpreter_preserves_guest_count_evidence_from_model() -> None:
     transport = httpx.MockTransport(
         lambda _request: httpx.Response(
@@ -277,7 +459,7 @@ async def test_interpreter_receives_hinglish_response_language() -> None:
     assert context["response_language"] == "hinglish"
     assert context["guest_text"] == "Mujhe room book karna hai."
     assert "Roman-script Hindi" in payload["messages"][0]["content"]
-    assert "verbatim STT transcript" in payload["messages"][0]["content"]
+    assert "guest_text is verbatim STT" in payload["messages"][0]["content"]
     response_format = payload["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["strict"] is True

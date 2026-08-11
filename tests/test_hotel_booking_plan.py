@@ -28,6 +28,15 @@ def test_explicit_room_type_replaces_unaccepted_recommendation_space() -> None:
     assert plan.requested_room_count == 3
 
 
+def test_hinglish_room_quantity_is_preserved_as_a_caller_fact() -> None:
+    plan = BookingPlan()
+
+    changed = plan.apply_caller_turn("दो rooms करवा दो.", ["standard", "suite"])
+
+    assert changed is True
+    assert plan.requested_room_count == 2
+
+
 def test_family_and_singles_are_preserved_as_distinct_room_groups() -> None:
     plan = BookingPlan()
 

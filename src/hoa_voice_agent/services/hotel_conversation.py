@@ -33,6 +33,7 @@ from hoa_voice_agent.services.hotel_booking_flow import (
     BookingSlotUpdate,
     BookingStateSnapshot,
     HotelBookingFlow,
+    explicit_guest_count_evidence_from_text,
     validate_guest_count_evidence,
 )
 from hoa_voice_agent.services.hotel_booking_offers import HotelBookingOfferService
@@ -443,6 +444,9 @@ class HotelConversationService:
             "booking_nights": conversation.booking_nights,
             "booking_room_preference": conversation.booking_room_preference,
             "booking_facts_json": conversation.booking_facts_json,
+            "booking_pending_fact_confirmation": self._booking_fact_ledger(
+                conversation
+            ).has_pending(),
             "booking_plan_json": conversation.booking_plan_json,
             "booking_last_search_result": conversation.booking_last_search_result,
             "booking_criteria_json": conversation.booking_criteria_json,
@@ -1049,6 +1053,7 @@ class HotelConversationService:
         interpretation: HotelTurnInterpretation | None,
         *,
         caller_text: str,
+        expected_date_slot: str | None = None,
     ) -> BookingSlotUpdate:
         if not interpretation:
             return BookingSlotUpdate()
@@ -1061,14 +1066,52 @@ class HotelConversationService:
             except ValueError:
                 return None
 
+        local_dates = HotelConversationService._extract_booking_slot_update(
+            caller_text,
+            today=date.today(),
+            expected_date_slot=expected_date_slot,
+        )
+
         evidence = validate_guest_count_evidence(
             caller_text,
             guest_count=interpretation.booking_guest_count,
             evidence=interpretation.booking_guest_count_evidence,
         )
+        if evidence.status == "unknown":
+            # Groq's JSON mode can validly omit an optional field even when
+            # the transcript contains an explicit Hindi/Hinglish party size.
+            # Recover only a directly evidenced count; never infer from room
+            # capacity, recommendations, or the next question.
+            local_evidence = explicit_guest_count_evidence_from_text(caller_text)
+            if local_evidence.status == "explicit":
+                evidence = local_evidence
+        model_check_in = parse_date(interpretation.booking_check_in)
+        model_check_out = parse_date(interpretation.booking_check_out)
+        if expected_date_slot == "check_out" and local_dates.check_out:
+            # A bare date answering an active checkout prompt must not be
+            # reused as a correction to the already accepted check-in date.
+            model_check_in = None
+            model_check_out = local_dates.check_out
+
+        check_in = local_dates.check_in or model_check_in
+        check_out = local_dates.check_out or model_check_out
+        # Once both dates are known, their difference is the only valid
+        # duration.  A model may extract the dates correctly yet hallucinate a
+        # stay length, as happened with a 13th-to-15th request becoming six
+        # nights.  Keep a model-provided duration only while a date is still
+        # missing.
+        nights = (
+            (check_out - check_in).days
+            if check_in and check_out and check_out > check_in
+            else interpretation.booking_nights
+        )
+
         return BookingSlotUpdate(
-            check_in=parse_date(interpretation.booking_check_in),
-            check_out=parse_date(interpretation.booking_check_out),
+            # Caller-verifiable date text outranks a model-normalized date.
+            # This prevents a malformed model date from replacing an explicit
+            # Hindi/Hinglish date the caller actually said.
+            check_in=check_in,
+            check_out=check_out,
             # Verbatim evidence can be committed as a new fact. Semantic
             # evidence is retained as a candidate and requires confirmation.
             guest_count=(
@@ -1078,7 +1121,7 @@ class HotelConversationService:
             ),
             guest_count_evidence=evidence.evidence,
             guest_count_evidence_status=evidence.status,
-            nights=interpretation.booking_nights,
+            nights=nights,
         )
 
     @staticmethod
@@ -1154,7 +1197,44 @@ class HotelConversationService:
             return f"{value} night{'s' if value != 1 else ''}"
         if field == "room_preference":
             return str(value).replace("_", " ").title()
+        if field == "booking_plan":
+            plan = BookingPlan.from_json(value if isinstance(value, str) else None)
+            parts: list[str] = []
+            if plan.requested_room_count is not None:
+                parts.append(
+                    f"{plan.requested_room_count} room"
+                    f"{'s' if plan.requested_room_count != 1 else ''}"
+                )
+            if plan.party_groups:
+                couple_count = sum(
+                    group.count
+                    for group in plan.party_groups
+                    if group.label.casefold() == "couple"
+                )
+                if couple_count:
+                    parts.append(
+                        f"{couple_count} couple"
+                        f"{'s' if couple_count != 1 else ''} together"
+                    )
+            return " with ".join(parts) if parts else "the requested room layout"
         return str(value)
+
+    @staticmethod
+    def _booking_plan_signature(value: str | None) -> tuple[Any, ...]:
+        """Compare layout meaning without treating JSON formatting as a change."""
+
+        plan = BookingPlan.from_json(value)
+        return (
+            tuple(
+                (group.label, group.people_per_group, group.count)
+                for group in plan.party_groups
+            ),
+            plan.room_count,
+            tuple((item.room_type, item.quantity) for item in plan.allocation),
+            plan.allow_mixed_types,
+            plan.allow_room_sharing,
+            plan.party_composition_known,
+        )
 
     def _booking_fact_confirmation_prompt(
         self,
@@ -1263,7 +1343,26 @@ class HotelConversationService:
         ):
             stage("room_preference", interpretation.booking_room_preference)
         if selected_plan and interpretation and interpretation.booking_plan_json:
-            stage("booking_plan", interpretation.booking_plan_json)
+            booking_plan_value = interpretation.booking_plan_json
+            try:
+                model_plan = json.loads(booking_plan_value)
+            except json.JSONDecodeError:
+                model_plan = None
+            if isinstance(model_plan, dict) and model_plan.get("room_count") is None:
+                caller_plan = BookingPlan.from_json(conversation.booking_plan_json)
+                caller_plan.apply_caller_turn(caller_text, [])
+                if caller_plan.requested_room_count is not None:
+                    # The semantic parser may describe the couple/group but
+                    # omit the separate room quantity from the same turn.
+                    # Preserve the caller-owned quantity before this plan is
+                    # staged as a pending fact.
+                    model_plan["room_count"] = caller_plan.requested_room_count
+                    model_plan["room_count_evidence"] = caller_text
+                    booking_plan_value = json.dumps(model_plan, sort_keys=True)
+            if self._booking_plan_signature(
+                conversation.booking_plan_json
+            ) != self._booking_plan_signature(booking_plan_value):
+                stage("booking_plan", booking_plan_value)
 
         self._sync_booking_fact_projection(conversation, ledger)
         return (
@@ -1354,6 +1453,11 @@ class HotelConversationService:
                 )
                 for result in results
             )
+            progression_prompt = self.booking_coordinator.progressive_booking_prompt(
+                conversation
+            )
+            if progression_prompt:
+                say = f"{say} {progression_prompt}"
         else:
             say = " ".join(
                 self.language_adapter.text(
@@ -1369,6 +1473,29 @@ class HotelConversationService:
         await self.store.add_turn(conversation.id, "assistant", say)
         await self.session.commit()
         return HotelTurnResponse(conversation.id, "booking", say)
+
+    @staticmethod
+    def _is_initial_party_composition_update(
+        conversation,
+        interpretation: HotelTurnInterpretation | None,
+    ) -> bool:
+        """Keep a caller's first couples answer out of the correction ledger."""
+
+        if not interpretation or not interpretation.booking_plan_json:
+            return False
+        current_plan = BookingPlan.from_json(conversation.booking_plan_json)
+        if current_plan.party_composition_known:
+            return False
+        try:
+            raw = json.loads(interpretation.booking_plan_json)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        return (
+            "party_composition_known" in raw
+            and set(raw).issubset({"party_composition_known", "party_groups"})
+        )
 
     async def _apply_interpreted_booking_plan(
         self,
@@ -1420,7 +1547,7 @@ class HotelConversationService:
         if not isinstance(raw, dict):
             return False
 
-        if not self._model_plan_matches_caller(raw, caller_plan):
+        if not self._model_plan_matches_caller(raw, caller_plan, caller_text):
             await self._record_audit(
                 conversation.id,
                 "booking_plan_rejected",
@@ -1461,14 +1588,22 @@ class HotelConversationService:
         if (
             allocation is None
             and party_groups is None
+            and raw.get("room_count") is None
             and allocation_mode is None
             and party_composition_known is None
         ):
             return False
 
         plan = BookingPlan.from_json(conversation.booking_plan_json)
+        # Preserve a caller-explicit room quantity even when the model returns
+        # only the related party composition.  The model may omit optional
+        # layout fields; it must not erase a fact the caller just supplied.
+        room_count = raw.get("room_count")
+        if room_count is None:
+            room_count = caller_plan.requested_room_count
         if not plan.apply_model_update(
             party_groups=party_groups,
+            room_count=room_count,
             room_allocation=allocation,
             allocation_mode=allocation_mode,
             party_composition_known=party_composition_known,
@@ -1522,8 +1657,33 @@ class HotelConversationService:
     def _model_plan_matches_caller(
         raw: dict[str, Any],
         caller_plan: BookingPlan,
+        caller_text: str,
     ) -> bool:
-        """Allow model plan values only when deterministic text supports them."""
+        """Allow model plan values only when the model supplies transcript evidence."""
+
+        if "room_count" in raw:
+            try:
+                room_count = int(raw["room_count"])
+            except (TypeError, ValueError):
+                return False
+            if not 1 <= room_count <= 100:
+                return False
+            evidence = raw.get("room_count_evidence")
+            if not isinstance(evidence, str) or not evidence.strip():
+                return False
+
+            def normalize(value: str) -> str:
+                return " ".join(
+                    unicodedata.normalize("NFKC", value).casefold().split()
+                )
+
+            if normalize(evidence) not in normalize(caller_text):
+                return False
+            if (
+                caller_plan.requested_room_count is not None
+                and caller_plan.requested_room_count != room_count
+            ):
+                return False
 
         if "room_allocation" in raw:
             model_allocation = raw.get("room_allocation")
@@ -1592,6 +1752,7 @@ class HotelConversationService:
             key in raw
             for key in (
                 "party_groups",
+                "room_count",
                 "room_allocation",
                 "allocation_mode",
                 "party_composition_known",
@@ -1847,10 +2008,86 @@ class HotelConversationService:
             verified_response = await self._return_verified_lookup_response(conversation)
             if verified_response:
                 return verified_response
-            say = self.language_adapter.text("understand_failure")
-            await self.store.add_turn(conversation.id, "assistant", say)
-            await self.session.commit()
-            return HotelTurnResponse(conversation.id, "interpreter_unavailable", say)
+            # A provider failure must not erase an explicit booking fact from
+            # the caller's transcript. Recover only locally verifiable slots,
+            # then let the normal controller/reducer choose the next step.
+            fallback_update = self._extract_booking_slot_update(
+                text, today=date.today()
+            )
+            local_guest_evidence = explicit_guest_count_evidence_from_text(text)
+            if local_guest_evidence.status == "explicit":
+                fallback_update = BookingSlotUpdate(
+                    check_in=fallback_update.check_in,
+                    check_out=fallback_update.check_out,
+                    guest_count=local_guest_evidence.guest_count,
+                    guest_count_evidence=local_guest_evidence.evidence,
+                    guest_count_evidence_status="explicit",
+                    nights=fallback_update.nights,
+                )
+            if fallback_update.has_value:
+                interpretation = HotelTurnInterpretation(
+                    intent="booking",
+                    action="ask_slot",
+                    dialogue_act="ask",
+                    confidence=1.0,
+                    booking_check_in=(
+                        fallback_update.check_in.isoformat()
+                        if fallback_update.check_in
+                        else None
+                    ),
+                    booking_check_out=(
+                        fallback_update.check_out.isoformat()
+                        if fallback_update.check_out
+                        else None
+                    ),
+                    booking_guest_count=fallback_update.guest_count,
+                    booking_guest_count_evidence=fallback_update.guest_count_evidence,
+                    booking_nights=fallback_update.nights,
+                )
+                await self._record_audit(
+                    conversation.id,
+                    "interpreter_failure_recovered",
+                    {
+                        "recovered_slots": {
+                            "check_in": (
+                                fallback_update.check_in.isoformat()
+                                if fallback_update.check_in
+                                else None
+                            ),
+                            "check_out": (
+                                fallback_update.check_out.isoformat()
+                                if fallback_update.check_out
+                                else None
+                            ),
+                            "guest_count": fallback_update.guest_count,
+                            "nights": fallback_update.nights,
+                        }
+                    },
+                )
+            if interpretation is None:
+                plan = BookingPlan.from_json(conversation.booking_plan_json)
+                if (
+                    conversation.booking_guest_count
+                    and conversation.booking_guest_count > 1
+                    and not plan.party_composition_known
+                ):
+                    # Both parser attempts failed, but the booking state tells
+                    # us exactly which fact is still needed. Do not describe
+                    # that provider failure as caller confusion.
+                    say = self.language_adapter.text(
+                        "booking_party_composition",
+                        guest_count=conversation.booking_guest_count,
+                    )
+                    conversation.pending_category = "booking"
+                    conversation.active_topic = "booking"
+                    conversation.state = "collecting_booking_allocation"
+                    await self.store.add_turn(conversation.id, "assistant", say)
+                    await self.session.commit()
+                    return HotelTurnResponse(conversation.id, "booking", say)
+                say = self.language_adapter.text("understand_failure")
+                await self.store.add_turn(conversation.id, "assistant", say)
+                await self.session.commit()
+                return HotelTurnResponse(conversation.id, "interpreter_unavailable", say)
         if self.interpreter and interpretation and interpretation.tool_error:
             return await self._return_interpreter_failure(conversation)
 
@@ -1891,6 +2128,24 @@ class HotelConversationService:
         )
         if pending_fact_response:
             return pending_fact_response
+
+        if controller_decision.action == "resume_booking_prompt":
+            progression_prompt = self.booking_coordinator.progressive_booking_prompt(
+                conversation
+            )
+            if progression_prompt:
+                conversation.pending_category = "booking"
+                conversation.active_topic = "booking"
+                conversation.state = "collecting_booking_allocation"
+                await self.store.add_turn(
+                    conversation.id, "assistant", progression_prompt
+                )
+                await self.session.commit()
+                return HotelTurnResponse(
+                    conversation.id,
+                    "booking",
+                    progression_prompt,
+                )
 
         if conversation.state == "awaiting_post_action_followup":
             if self.interpreter:
@@ -2006,11 +2261,24 @@ class HotelConversationService:
         accepts_fact_candidates = (
             not self.interpreter or controller_decision.accepts_fact_candidates
         )
+        expected_date_slot = (
+            "check_out"
+            if conversation.booking_check_in and not conversation.booking_check_out
+            else None
+        )
         booking_update = (
-            self._booking_update_from_interpretation(interpretation, caller_text=text)
+            self._booking_update_from_interpretation(
+                interpretation,
+                caller_text=text,
+                expected_date_slot=expected_date_slot,
+            )
             if self.interpreter and accepts_fact_candidates
             else (
-                self._extract_booking_slot_update(text, today=date.today())
+                self._extract_booking_slot_update(
+                    text,
+                    today=date.today(),
+                    expected_date_slot=expected_date_slot,
+                )
                 if not self.interpreter and accepts_fact_candidates
                 else BookingSlotUpdate()
             )
@@ -2059,6 +2327,10 @@ class HotelConversationService:
                 interpretation
                 and interpretation.booking_plan_json
                 and dialogue_decision.can_update_booking_plan
+                and not self._is_initial_party_composition_update(
+                    conversation,
+                    interpretation,
+                )
             )
             booking_update, fact_proposals = self._stage_booking_fact_changes(
                 conversation,
@@ -2169,6 +2441,49 @@ class HotelConversationService:
             )
             if composition_response:
                 return composition_response
+        if interpreted_plan_changed and not self._booking_lookup_completed_this_turn:
+            # A caller-owned layout fact must advance the slot-filling flow in
+            # the same turn. Otherwise the model can acknowledge the fact and
+            # leave the call with no next question. This is local state work:
+            # no second LLM call and no PMS lookup are needed.
+            progression_prompt = self.booking_coordinator.progressive_booking_prompt(
+                conversation
+            )
+            if progression_prompt:
+                conversation.pending_category = "booking"
+                conversation.active_topic = "booking"
+                conversation.state = "collecting_booking_allocation"
+                await self.store.add_turn(
+                    conversation.id, "assistant", progression_prompt
+                )
+                await self.session.commit()
+                return HotelTurnResponse(conversation.id, "booking", progression_prompt)
+        if (
+            not interpreted_plan_changed
+            and interpretation
+            and interpretation.intent == "booking"
+            and interpretation.booking_plan_json
+            and plan_after_turn.party_composition_known
+            and not self._booking_lookup_completed_this_turn
+        ):
+            # Repeating an already-known party answer is an idempotent semantic
+            # turn, not a correction and not an interpreter failure. Continue
+            # from the persisted booking state instead of asking the caller to
+            # repeat themselves.
+            progression_prompt = self.booking_coordinator.progressive_booking_prompt(
+                conversation
+            )
+            if progression_prompt:
+                conversation.pending_category = "booking"
+                conversation.active_topic = "booking"
+                conversation.state = "collecting_booking_allocation"
+                await self.store.add_turn(
+                    conversation.id, "assistant", progression_prompt
+                )
+                await self.session.commit()
+                return HotelTurnResponse(
+                    conversation.id, "booking", progression_prompt
+                )
         if (
             interpretation
             and interpretation.intent == "booking"
@@ -2799,6 +3114,25 @@ class HotelConversationService:
                         await self.store.add_turn(conversation.id, "assistant", offer_response)
                         await self.session.commit()
                         return HotelTurnResponse(conversation.id, "booking", offer_response)
+                # The semantic parser owns only meaning and facts. It is
+                # intentionally allowed to omit caller-facing prose, so a
+                # valid date/guest update must advance from persisted state
+                # instead of falling through to the generic repeat response.
+                # This is local policy work: it adds neither an LLM call nor
+                # a PMS query.
+                if not self._booking_lookup_completed_this_turn and not interpretation.response:
+                    progression_prompt = self.booking_coordinator.progressive_booking_prompt(
+                        conversation
+                    )
+                    if progression_prompt:
+                        conversation.state = "collecting_booking_allocation"
+                        await self.store.add_turn(
+                            conversation.id, "assistant", progression_prompt
+                        )
+                        await self.session.commit()
+                        return HotelTurnResponse(
+                            conversation.id, "booking", progression_prompt
+                        )
                 if interpretation.action in {
                     "answer",
                     "ask_slot",
@@ -3717,7 +4051,12 @@ class HotelConversationService:
         )
 
     @staticmethod
-    def _extract_booking_slot_update(text: str, *, today: date) -> BookingSlotUpdate:
+    def _extract_booking_slot_update(
+        text: str,
+        *,
+        today: date,
+        expected_date_slot: str | None = None,
+    ) -> BookingSlotUpdate:
         """Extract explicit booking slots before dialogue routing.
 
         This intentionally covers the reliable, high-impact voice forms.  The
@@ -3726,6 +4065,232 @@ class HotelConversationService:
         """
 
         normalized = " ".join(text.casefold().split())
+
+        month_numbers = {
+            "january": 1,
+            "jan": 1,
+            "february": 2,
+            "feb": 2,
+            "march": 3,
+            "mar": 3,
+            "april": 4,
+            "apr": 4,
+            "may": 5,
+            "june": 6,
+            "jun": 6,
+            "july": 7,
+            "jul": 7,
+            "august": 8,
+            "aug": 8,
+            "september": 9,
+            "sep": 9,
+            "sept": 9,
+            "october": 10,
+            "oct": 10,
+            "november": 11,
+            "nov": 11,
+            "december": 12,
+            "dec": 12,
+            "जनवरी": 1,
+            "फरवरी": 2,
+            "मार्च": 3,
+            "अप्रैल": 4,
+            "मई": 5,
+            "जून": 6,
+            "जुलाई": 7,
+            "अगस्त": 8,
+            "सितंबर": 9,
+            "सितम्बर": 9,
+            "अक्टूबर": 10,
+            "नवंबर": 11,
+            "नवम्बर": 11,
+            "दिसंबर": 12,
+            "दिसम्बर": 12,
+        }
+        day_numbers = {
+            "one": 1,
+            "first": 1,
+            "two": 2,
+            "second": 2,
+            "three": 3,
+            "third": 3,
+            "four": 4,
+            "fourth": 4,
+            "five": 5,
+            "fifth": 5,
+            "six": 6,
+            "sixth": 6,
+            "seven": 7,
+            "seventh": 7,
+            "eight": 8,
+            "eighth": 8,
+            "nine": 9,
+            "ninth": 9,
+            "ten": 10,
+            "tenth": 10,
+            "eleven": 11,
+            "twelve": 12,
+            "thirteen": 13,
+            "fourteen": 14,
+            "fifteen": 15,
+            "sixteen": 16,
+            "seventeen": 17,
+            "eighteen": 18,
+            "nineteen": 19,
+            "twenty": 20,
+            "twenty one": 21,
+            "twenty two": 22,
+            "twenty three": 23,
+            "twenty four": 24,
+            "twenty five": 25,
+            "twenty six": 26,
+            "twenty seven": 27,
+            "twenty eight": 28,
+            "twenty nine": 29,
+            "thirty": 30,
+            "thirty one": 31,
+            "ek": 1,
+            "do": 2,
+            "teen": 3,
+            "tin": 3,
+            "char": 4,
+            "chaar": 4,
+            "paanch": 5,
+            "panch": 5,
+            "che": 6,
+            "chhe": 6,
+            "chhah": 6,
+            "saat": 7,
+            "aath": 8,
+            "ath": 8,
+            "nau": 9,
+            "das": 10,
+            "gyarah": 11,
+            "barah": 12,
+            "terah": 13,
+            "chaudah": 14,
+            "pandrah": 15,
+            "solah": 16,
+            "satrah": 17,
+            "atharah": 18,
+            "unnis": 19,
+            "bees": 20,
+            "baais": 22,
+            "bais": 22,
+            "teis": 23,
+            "chaubees": 24,
+            "pachis": 25,
+            "chhabbees": 26,
+            "sattais": 27,
+            "atthais": 28,
+            "untis": 29,
+            "tees": 30,
+            "ikattis": 31,
+            "एक": 1,
+            "दो": 2,
+            "तीन": 3,
+            "चार": 4,
+            "पाँच": 5,
+            "पांच": 5,
+            "छह": 6,
+            "छः": 6,
+            "सात": 7,
+            "आठ": 8,
+            "नौ": 9,
+            "दस": 10,
+            "ग्यारह": 11,
+            "बारह": 12,
+            "तेरह": 13,
+            "चौदह": 14,
+            "पंद्रह": 15,
+            "पन्द्रह": 15,
+            "सोलह": 16,
+            "सत्रह": 17,
+            "अठारह": 18,
+            "उन्नीस": 19,
+            "बीस": 20,
+            "इक्कीस": 21,
+            "बाईस": 22,
+            "बाइस": 22,
+            "तेईस": 23,
+            "तेइस": 23,
+            "चौबीस": 24,
+            "पच्चीस": 25,
+            "छब्बीस": 26,
+            "सत्ताईस": 27,
+            "सत्ताइस": 27,
+            "अट्ठाईस": 28,
+            "अट्ठाइस": 28,
+            "उनतीस": 29,
+            "तीस": 30,
+            "इकतीस": 31,
+        }
+
+        def token_pattern(values: dict[str, int]) -> str:
+            return "|".join(
+                sorted((re.escape(value) for value in values), key=len, reverse=True)
+            )
+
+        def parse_day(value: str) -> int | None:
+            if value.isdigit():
+                parsed = int(value)
+            else:
+                parsed = day_numbers.get(value)
+            return parsed if parsed is not None and 1 <= parsed <= 31 else None
+
+        def parse_absolute_date(day: str, month: str, year: str | None) -> date | None:
+            day_value = parse_day(day)
+            month_value = month_numbers.get(month)
+            if day_value is None or month_value is None:
+                return None
+            try:
+                return date(int(year) if year else today.year, month_value, day_value)
+            except ValueError:
+                return None
+
+        day_pattern = rf"(?:\d{{1,2}}|{token_pattern(day_numbers)})"
+        month_pattern = token_pattern(month_numbers)
+        date_mentions = list(
+            re.finditer(
+                rf"(?P<day>{day_pattern})\s*(?:st|nd|rd|th)?\s*"
+                rf"(?P<month>{month_pattern})(?:\s+(?P<year>20\d{{2}}))?"
+                rf"|(?P<month_first>{month_pattern})\s+(?P<day_first>{day_pattern})"
+                rf"(?:\s*,?\s*(?P<year_first>20\d{{2}}))?",
+                normalized,
+            )
+        )
+        absolute_dates: list[date] = []
+        for match in date_mentions:
+            absolute = parse_absolute_date(
+                match.group("day") or match.group("day_first"),
+                match.group("month") or match.group("month_first"),
+                match.group("year") or match.group("year_first"),
+            )
+            if absolute:
+                absolute_dates.append(absolute)
+
+        check_in = absolute_dates[0] if absolute_dates else None
+        check_out = absolute_dates[1] if len(absolute_dates) > 1 else None
+        if (
+            expected_date_slot == "check_out"
+            and len(absolute_dates) == 1
+            and not re.search(r"\b(?:check[- ]?in|arrival)\b", normalized)
+        ):
+            check_in = None
+            check_out = absolute_dates[0]
+        if check_in and not check_out:
+            checkout_match = re.search(
+                rf"(?:check[- ]?out|checkout|departure)\b.*?"
+                rf"(?P<day>{day_pattern})(?!\s*(?:{month_pattern}))",
+                normalized,
+            )
+            if checkout_match:
+                checkout_day = parse_day(checkout_match.group("day"))
+                if checkout_day:
+                    try:
+                        check_out = date(today.year, check_in.month, checkout_day)
+                    except ValueError:
+                        check_out = None
 
         def relative_date(value: str) -> date | None:
             phrase = value.strip().removeprefix("the ").removeprefix("a ")
@@ -3742,8 +4307,12 @@ class HotelConversationService:
             )
             return relative_date(match.group("value")) if match else None
 
-        check_in = labelled_date(r"check[- ]?in|arrival")
-        check_out = labelled_date(r"check[- ]?out|checkout|departure")
+        labelled_check_in = labelled_date(r"check[- ]?in|arrival")
+        labelled_check_out = labelled_date(r"check[- ]?out|checkout|departure")
+        if labelled_check_in:
+            check_in = labelled_check_in
+        if labelled_check_out:
+            check_out = labelled_check_out
         if not check_in and not check_out:
             # In an active booking, callers naturally say "rooms for
             # tomorrow" rather than the more formal "my check-in is

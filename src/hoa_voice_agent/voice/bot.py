@@ -287,7 +287,7 @@ async def run_bot(
                 messaging=messaging,
                 notification_channel=settings.vendor_notification_channel,
                 interpreter=OpenAIHotelTurnInterpreter(
-                    api_key=settings.hotel_llm_api_key,
+                    api_key=settings.resolved_hotel_llm_api_key,
                     base_url=settings.hotel_llm_base_url,
                     model=settings.hotel_llm_model,
                     reasoning_effort=settings.hotel_llm_reasoning_effort,

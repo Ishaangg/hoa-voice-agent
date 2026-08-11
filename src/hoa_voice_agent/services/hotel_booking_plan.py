@@ -24,8 +24,37 @@ _NUMBER_WORDS = {
     "eight": 8,
     "nine": 9,
     "ten": 10,
+    "ek": 1,
+    "do": 2,
+    "teen": 3,
+    "tin": 3,
+    "char": 4,
+    "chaar": 4,
+    "paanch": 5,
+    "panch": 5,
+    "chhe": 6,
+    "cheh": 6,
+    "saat": 7,
+    "aath": 8,
+    "ath": 8,
+    "nau": 9,
+    "das": 10,
+    "एक": 1,
+    "दो": 2,
+    "तीन": 3,
+    "चार": 4,
+    "पाँच": 5,
+    "पांच": 5,
+    "छह": 6,
+    "छः": 6,
+    "सात": 7,
+    "आठ": 8,
+    "नौ": 9,
+    "दस": 10,
 }
-_NUMBER_PATTERN = r"\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten"
+_NUMBER_PATTERN = "|".join(
+    re.escape(value) for value in sorted(_NUMBER_WORDS, key=len, reverse=True)
+) + r"|\d+"
 
 
 def _number(value: str) -> int:
@@ -149,8 +178,9 @@ class BookingPlan:
         # "I need a room" starts a booking; it is not the caller choosing a
         # one-room allocation.  Only an explicit numeric/word count becomes
         # a room-count constraint here.
-        explicit_count_pattern = r"\d+|one|two|three|four|five|six|seven|eight|nine|ten"
-        generic_room_count = re.search(rf"\b(?:{explicit_count_pattern})\s+rooms?\b", normalized)
+        generic_room_count = re.search(
+            rf"\b(?:{_NUMBER_PATTERN})\s+rooms?\b", normalized
+        )
         allocation = self._parse_allocation(normalized, room_types)
         if allocation:
             if allocation != self.allocation or self.allow_mixed_types:
@@ -197,6 +227,7 @@ class BookingPlan:
         self,
         *,
         party_groups: list[dict] | None = None,
+        room_count: int | None = None,
         room_allocation: list[dict] | None = None,
         allocation_mode: str | None = None,
         party_composition_known: bool | None = None,
@@ -247,6 +278,19 @@ class BookingPlan:
         ):
             self.allow_room_sharing = False
             changed = True
+
+        if room_count is not None:
+            try:
+                parsed_room_count = int(room_count)
+            except (TypeError, ValueError):
+                return False
+            if not 1 <= parsed_room_count <= 100:
+                return False
+            if self.room_count != parsed_room_count or self.allocation:
+                self.room_count = parsed_room_count
+                self.allocation = []
+                self.allow_mixed_types = False
+                changed = True
 
         parsed_allocation: list[RoomTypeRequest] = []
         if room_allocation:

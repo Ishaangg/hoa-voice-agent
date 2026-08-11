@@ -106,11 +106,12 @@ class VoiceRuntimeSettings(BaseSettings):
     # These legacy names configure the existing HOA LLM only.
     groq_llm_base_url: str = "https://api.openai.com/v1"
     groq_llm_model: str = "gpt-5.4-nano"
-    # The hotel interpreter has its own provider configuration. It is used
-    # only to choose and summarize read-only PMS tool calls.
+    # The hotel interpreter has its own provider configuration. The demo uses
+    # Groq's OpenAI-compatible endpoint and reuses GROQ_API_KEY; a different
+    # endpoint can still use HOTEL_LLM_API_KEY.
     hotel_llm_api_key: str | None = None
-    hotel_llm_base_url: str = "https://api.openai.com/v1"
-    hotel_llm_model: str = "gpt-5.6-luna"
+    hotel_llm_base_url: str = "https://api.groq.com/openai/v1"
+    hotel_llm_model: str = "qwen/qwen3.6-27b"
     hotel_llm_reasoning_effort: Literal[
         "none", "low", "medium", "high", "xhigh", "max"
     ] = "none"
@@ -167,11 +168,24 @@ class VoiceRuntimeSettings(BaseSettings):
         extra="ignore",
     )
 
+    @property
+    def resolved_hotel_llm_api_key(self) -> str | None:
+        """Return the credential that matches the configured hotel endpoint."""
+
+        if self.hotel_llm_base_url.rstrip("/").casefold() == "https://api.groq.com/openai/v1":
+            return self.groq_api_key or self.hotel_llm_api_key
+        return self.hotel_llm_api_key
+
     @model_validator(mode="after")
     def require_provider_keys(self) -> "VoiceRuntimeSettings":
         if self.voice_domain == "hoa" and not self.groq_api_key:
             raise ValueError("GROQ_API_KEY is required for the HOA voice LLM.")
-        if self.voice_domain == "hotel" and not self.hotel_llm_api_key:
+        if self.voice_domain == "hotel" and not self.resolved_hotel_llm_api_key:
+            if self.hotel_llm_base_url.rstrip("/").casefold() == "https://api.groq.com/openai/v1":
+                raise ValueError(
+                    "GROQ_API_KEY or HOTEL_LLM_API_KEY is required for the hotel PMS "
+                    "interpreter when using Groq."
+                )
             raise ValueError("HOTEL_LLM_API_KEY is required for the hotel PMS interpreter.")
         if self.voice_stt_provider == "nvidia" and not self.nvidia_api_key:
             raise ValueError(

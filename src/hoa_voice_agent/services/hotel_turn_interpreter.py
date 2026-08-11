@@ -169,6 +169,7 @@ class HotelTurnInterpreter(Protocol):
         booking_nights: int | None = None,
         booking_room_preference: str | None = None,
         booking_facts_json: str | None = None,
+        booking_pending_fact_confirmation: bool = False,
         booking_plan_json: str | None = None,
         booking_last_search_result: str | None = None,
         booking_criteria_json: str | None = None,
@@ -178,7 +179,7 @@ class HotelTurnInterpreter(Protocol):
         ...
 
 
-_SYSTEM_PROMPT = """You are the semantic interpreter for a hotel voice concierge.
+_TOOL_COMPATIBILITY_SYSTEM_PROMPT = """You are the semantic interpreter for a hotel voice concierge.
 Understand natural speech, speech-to-text errors, short answers, and incomplete
 answers. Return a structured decision; never claim that a database write or
 booking happened unless the application confirms it.
@@ -260,14 +261,18 @@ Rules:
 - booking_plan_json is optional and may contain only caller-explicit layout
   facts in this exact shape: {"party_groups":[{"label":"couple",
   "people_per_group":2,"count":1}],"room_allocation":[{"room_type":"standard",
-  "quantity":1}],"allocation_mode":"mixed|shared|separate",
+  "quantity":1}],"room_count":3,"room_count_evidence":"three rooms",
+  "allocation_mode":"mixed|shared|separate",
   "party_composition_known":true}. Omit a key when the caller did not say it.
+  When the caller explicitly gives only an untyped room quantity, return
+  room_count and copy the exact transcript span into room_count_evidence. Do
+  not infer room_count from guests, couples, capacity, or a recommendation.
   When the application asks how many couples are in a group, set
   party_composition_known=true and return party_groups for the couples. If the
   caller says there are no couples, return party_composition_known=true with
   party_groups=[]. Do not invent a number of couples or a room layout.
   Never put a PMS recommendation, an offered alternative, or an assumed room
-  count in room_allocation.
+  count in room_count or room_allocation.
 - If the persisted booking plan already contains party_groups and
   allow_room_sharing=false, that non-sharing layout is already settled. Keep
   each described group together and let the application place ungrouped
@@ -350,6 +355,61 @@ Rules:
 - If a tool result says nothing was found, say so plainly and do not guess.
 - For ordinary turns, final speech should be one or two short sentences.
 """
+
+
+_COMPACT_SYSTEM_PROMPT = """You are a semantic parser for a hotel voice assistant.
+Return exactly one JSON object; omit unknown fields. The application controls
+database writes, holds, availability, prices, and replies.
+
+Use only these fields when needed:
+- intent: booking, identity_provided, identity_correction, identity_question,
+  room_service, housekeeping, maintenance, security, concierge, faq,
+  confirmation, cancellation, general, or unknown.
+- action: answer, ask_slot, clarify, confirm, create_request, cancel,
+  amend_request, backchannel, or none.
+- dialogue_act: inform, ask, choose, accept, reject, correct, compare, cancel,
+  backchannel, uncertain, other, or unknown.
+- command: update_facts, ask_about_state, request_recommendation,
+  select_option, accept_offer, reject_offer, cancel, inform, or unknown.
+- action is the dialogue verb; command is the application meaning. New facts:
+  action="answer", command="update_facts"; never put update_facts in action.
+- name, room_number, service_category, service_description, and
+  follow_up_question only when the caller actually supplied them.
+- booking_check_in and booking_check_out as ISO dates; booking_nights; and
+  booking_guest_count with an exact short booking_guest_count_evidence span
+  copied from guest_text. Never infer a guest count.
+- booking_room_preference only for a caller-selected room type.
+- booking_plan_json only for caller-stated layout facts. It may be a JSON
+  object with party_composition_known and party_groups. A couple is
+  {"label":"couple","people_per_group":2,"count":N}. For an explicit
+  untyped room quantity, include room_count and exact room_count_evidence;
+  never turn it into an empty allocation. Never infer room allocation,
+  prices, availability, or unstated groups.
+- booking_required_features, booking_preferred_features,
+  booking_excluded_features, booking_removed_features,
+  booking_max_nightly_rate_cents, booking_bed_type,
+  booking_accessibility_required, booking_criteria_evidence: caller-stated
+  room requirements only; use feature keys present in context.
+
+guest_text is verbatim STT; never translate it. expected_booking_slot=
+party_composition means answer how many couples: return booking_plan_json with
+party_composition_known and stated couple groups only. No couples means
+party_groups=[] (informative, not rejection). "Around one couple" is one couple;
+do not invent the remaining guests. If
+booking_pending_fact_confirmation=true, a semantic yes is action="confirm",
+dialogue_act="accept", command="accept_offer". Otherwise a bare acknowledgement
+with no fact is action="backchannel", dialogue_act="backchannel".
+Examples: pending confirmation + "\u0939\u093e\u0902 \u091c\u0940" -> confirm, accept,
+accept_offer. No pending confirmation + "Okay" -> backchannel, backchannel.
+"""
+
+
+_COMPACT_RETRY_PROMPT = """Return exactly one minimal JSON object for the caller's
+latest hotel turn. Omit unknown fields. Do not write prose, markdown, booking
+claims, prices, availability, or a room allocation. Preserve caller-provided
+facts only. If expected_booking_slot is party_composition, return
+booking_plan_json with party_composition_known and stated couple groups; no
+couples means party_groups=[] and an informative answer."""
 
 
 def _tool_progress_key(tool_calls: list[dict[str, Any]]) -> str:
@@ -509,6 +569,7 @@ class OpenAIHotelTurnInterpreter:
         booking_nights: int | None = None,
         booking_room_preference: str | None = None,
         booking_facts_json: str | None = None,
+        booking_pending_fact_confirmation: bool = False,
         booking_plan_json: str | None = None,
         booking_last_search_result: str | None = None,
         booking_criteria_json: str | None = None,
@@ -534,6 +595,10 @@ class OpenAIHotelTurnInterpreter:
             ("booking_nights", booking_nights),
             ("booking_room_preference", booking_room_preference),
             ("booking_facts_json", booking_facts_json),
+            (
+                "booking_pending_fact_confirmation",
+                booking_pending_fact_confirmation,
+            ),
             ("booking_plan_json", booking_plan_json),
             ("booking_last_search_result", booking_last_search_result),
             ("booking_criteria_json", booking_criteria_json),
@@ -555,15 +620,43 @@ class OpenAIHotelTurnInterpreter:
                     "llm_request",
                     {"phase": "initial", "payload": first_payload},
                 )
-                first = await self._post_completion(
-                    client,
-                    first_payload,
-                    audit_event=audit_event,
-                    audit_phase="initial",
-                )
-                first_data = first.json()
-                if not tool_executor:
-                    return self._parse_response(first_data)
+                try:
+                    first = await self._post_completion(
+                        client,
+                        first_payload,
+                        audit_event=audit_event,
+                        audit_phase="initial",
+                    )
+                    first_data = first.json()
+                    if not tool_executor:
+                        interpretation = self._parse_response(first_data)
+                        if self._needs_semantic_slot_repair(interpretation, context):
+                            repaired = await self._retry_compact_interpretation(
+                                client,
+                                context,
+                                audit_event=audit_event,
+                                initial_error=ValueError(
+                                    "active booking slot was not semantically resolved"
+                                ),
+                            )
+                            return repaired or interpretation
+                        return interpretation
+                except (
+                    httpx.HTTPError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    ValidationError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    if tool_executor is not None:
+                        raise
+                    return await self._retry_compact_interpretation(
+                        client,
+                        context,
+                        audit_event=audit_event,
+                        initial_error=exc,
+                    )
 
                 message = (first_data.get("choices") or [{}])[0].get("message") or {}
                 tool_calls = message.get("tool_calls") or []
@@ -1067,27 +1160,193 @@ class OpenAIHotelTurnInterpreter:
             english_voice="",
             hindi_voice="",
         )
+        request_context = self._request_context(context, with_tools=with_tools)
+        prompt = (
+            _TOOL_COMPATIBILITY_SYSTEM_PROMPT
+            if with_tools
+            else _COMPACT_SYSTEM_PROMPT
+        )
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        f"{_SYSTEM_PROMPT}\nSelected language contract: "
+                        f"{prompt}\nSelected language contract: "
                         f"{adapter.llm_instruction}"
                     ),
                 },
-                {"role": "user", "content": json.dumps(context)},
+                {"role": "user", "content": json.dumps(request_context)},
             ],
-            "max_completion_tokens": 300,
-            "reasoning_effort": self._reasoning_effort,
+            "max_completion_tokens": (
+                300
+                if with_tools
+                else (96 if request_context.get("expected_booking_slot") else 256)
+            ),
         }
+        if self._supports_reasoning_effort():
+            payload["reasoning_effort"] = self._reasoning_effort
         if with_tools:
             payload["tools"] = HOTEL_TOOL_DEFINITIONS
             payload["tool_choice"] = "auto"
         else:
-            payload["response_format"] = self._structured_response_format()
+            payload["response_format"] = (
+                {"type": "json_object"}
+                if self._uses_groq_json_object_mode()
+                else self._structured_response_format()
+            )
         return payload
+
+    async def _retry_compact_interpretation(
+        self,
+        client: httpx.AsyncClient,
+        context: dict[str, Any],
+        *,
+        audit_event: HotelAuditEvent | None,
+        initial_error: Exception,
+    ) -> HotelTurnInterpretation | None:
+        """Retry once with a smaller state-scoped JSON patch after parser failure."""
+
+        retry_context = self._request_context(context, with_tools=False)
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": _COMPACT_RETRY_PROMPT},
+                {"role": "user", "content": json.dumps(retry_context)},
+            ],
+            "max_completion_tokens": 128,
+            "response_format": {"type": "json_object"},
+        }
+        if self._supports_reasoning_effort():
+            payload["reasoning_effort"] = self._reasoning_effort
+        if isinstance(initial_error, httpx.HTTPStatusError):
+            reason = self._provider_error_detail(initial_error.response)
+        else:
+            reason = str(initial_error)
+        logger.warning(
+            "Hotel semantic parser failed; retrying once with compact context: {}",
+            reason,
+        )
+        await self._emit_audit(
+            audit_event,
+            "llm_request",
+            {"phase": "initial_compact_retry", "payload": payload},
+        )
+        try:
+            response = await self._post_completion(
+                client,
+                payload,
+                audit_event=audit_event,
+                audit_phase="initial_compact_retry",
+            )
+            return self._parse_response(response.json())
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Hotel compact retry was rejected status={} detail={}",
+                exc.response.status_code,
+                self._provider_error_detail(exc.response),
+            )
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            ValueError,
+            ValidationError,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.warning("Hotel compact parser retry failed: {}", exc)
+        return None
+
+    @staticmethod
+    def _needs_semantic_slot_repair(
+        interpretation: HotelTurnInterpretation,
+        context: dict[str, Any],
+    ) -> bool:
+        """Retry only when the model failed to resolve the active booking slot."""
+
+        if OpenAIHotelTurnInterpreter._expected_booking_slot(context) != (
+            "party_composition"
+        ):
+            return False
+        return (
+            interpretation.intent in {"unknown", "general", "faq"}
+            or interpretation.command == "unknown"
+            or interpretation.dialogue_act in {"unknown", "uncertain", "reject"}
+            or interpretation.booking_plan_json is None
+        )
+
+    @staticmethod
+    def _expected_booking_slot(context: dict[str, Any]) -> str | None:
+        """Return the one booking fact the current state explicitly needs next."""
+
+        guest_count = context.get("booking_guest_count")
+        if not isinstance(guest_count, int) or guest_count <= 1:
+            return None
+        raw_plan = context.get("booking_plan_json")
+        if not isinstance(raw_plan, str) or not raw_plan:
+            return "party_composition"
+        try:
+            plan = json.loads(raw_plan)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(plan, dict) and plan.get("party_composition_known") is not True:
+            return "party_composition"
+        return None
+
+    @classmethod
+    def _request_context(
+        cls,
+        context: dict[str, Any],
+        *,
+        with_tools: bool,
+    ) -> dict[str, Any]:
+        """Keep a focused slot answer independent of unrelated hotel context."""
+
+        if with_tools:
+            return context
+        expected_slot = cls._expected_booking_slot(context)
+        if not expected_slot:
+            return context
+        fields = (
+            "current_date",
+            "guest_text",
+            "response_language",
+            "last_assistant_turn",
+            "pending_category",
+            "active_topic",
+            "last_intent",
+            "booking_check_in",
+            "booking_check_out",
+            "booking_guest_count",
+            "booking_nights",
+            "booking_pending_fact_confirmation",
+            "booking_plan_json",
+        )
+        compact = {
+            field: context[field]
+            for field in fields
+            if context.get(field) not in (None, "")
+            and (
+                field != "booking_pending_fact_confirmation" or context[field] is True
+            )
+        }
+        compact["expected_booking_slot"] = expected_slot
+        return compact
+
+    def _supports_reasoning_effort(self) -> bool:
+        """Avoid provider fields that the selected model family rejects."""
+
+        if "api.groq.com" not in self._base_url.casefold():
+            return True
+        model = self._model.casefold()
+        return model.startswith(("qwen", "openai/gpt-oss"))
+
+    def _uses_groq_json_object_mode(self) -> bool:
+        """Use JSON Object Mode unless the Groq model has documented schema support."""
+
+        if "api.groq.com" not in self._base_url.casefold():
+            return False
+        return not self._model.casefold().startswith("openai/gpt-oss")
 
     @staticmethod
     def _parse_response(payload: dict[str, Any]) -> HotelTurnInterpretation:

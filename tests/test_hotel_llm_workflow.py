@@ -1,4 +1,7 @@
 import json
+from datetime import date
+
+import httpx
 
 from hoa_voice_agent.persistence.database import Database
 from hoa_voice_agent.persistence.seed import (
@@ -11,7 +14,10 @@ from hoa_voice_agent.services.hotel_audit import HotelConversationAuditLog
 from hoa_voice_agent.services.hotel_booking_offers import HotelBookingOfferService
 from hoa_voice_agent.services.hotel_booking_plan import BookingPlan
 from hoa_voice_agent.services.hotel_conversation import HotelConversationService
-from hoa_voice_agent.services.hotel_turn_interpreter import HotelTurnInterpretation
+from hoa_voice_agent.services.hotel_turn_interpreter import (
+    HotelTurnInterpretation,
+    OpenAIHotelTurnInterpreter,
+)
 
 
 async def _mark_no_couples_answered(service: HotelConversationService, conversation_id) -> None:
@@ -149,6 +155,36 @@ class EvidenceGuestCountInterpreter:
         )
 
 
+class UnavailableHotelInterpreter:
+    async def interpret(self, **kwargs):
+        return None
+
+
+class UnknownHotelInterpreter:
+    async def interpret(self, **kwargs):
+        return HotelTurnInterpretation(
+            intent="unknown",
+            action="none",
+            dialogue_act="unknown",
+            command="unknown",
+        )
+
+
+class BookingDatesWithoutSpeechInterpreter:
+    """Models the semantic parser extracting dates without generating prose."""
+
+    async def interpret(self, **kwargs):
+        return HotelTurnInterpretation(
+            intent="booking",
+            action="answer",
+            dialogue_act="inform",
+            command="update_facts",
+            booking_check_in="2026-08-13",
+            booking_check_out="2026-08-15",
+            booking_nights=6,
+        )
+
+
 class BookingFactCorrectionInterpreter:
     def __init__(self) -> None:
         self.calls = 0
@@ -175,6 +211,14 @@ class BookingFactCorrectionInterpreter:
                 response="I heard six guests.",
                 booking_guest_count=6,
                 booking_guest_count_evidence="six guests",
+                confidence=0.99,
+            )
+        if text in {"okay", "okay.", "ok", "ok."}:
+            return HotelTurnInterpretation(
+                intent="booking",
+                action="backchannel",
+                dialogue_act="backchannel",
+                command="inform",
                 confidence=0.99,
             )
         return HotelTurnInterpretation(
@@ -623,6 +667,67 @@ class InventedRoomQuantityInterpreter:
         )
 
 
+class RoomCountOnlyInterpreter:
+    """The caller gives an untyped room count before any stay dates."""
+
+    async def interpret(self, **kwargs):
+        return HotelTurnInterpretation(
+            intent="booking",
+            action="answer",
+            command="update_facts",
+            dialogue_act="inform",
+            response="Bilkul, aapko teen rooms book karne hain.",
+            booking_plan_json=json.dumps(
+                {
+                    "room_count": 3,
+                    "room_count_evidence": "तीन कमरे",
+                }
+            ),
+            confidence=0.99,
+        )
+
+
+class PartyCompositionOnlyInterpreter:
+    """The model repeats known groups but omits the caller's room quantity."""
+
+    async def interpret(self, **kwargs):
+        return HotelTurnInterpretation(
+            intent="booking",
+            action="answer",
+            command="update_facts",
+            dialogue_act="inform",
+            booking_plan_json=json.dumps(
+                {
+                    "party_composition_known": True,
+                    "party_groups": [
+                        {
+                            "label": "couple",
+                            "people_per_group": 2,
+                            "count": 1,
+                        }
+                    ],
+                }
+            ),
+            confidence=0.99,
+        )
+
+
+class NoCouplesInterpreter:
+    """The caller answers the active composition question with no couples."""
+
+    async def interpret(self, **kwargs):
+        return HotelTurnInterpretation(
+            intent="booking",
+            action="answer",
+            dialogue_act="inform",
+            command="update_facts",
+            booking_plan_json=json.dumps(
+                {"party_composition_known": True, "party_groups": []}
+            ),
+            confidence=0.99,
+        )
+
+
 class ContextThenNoMoreInterpreter:
     """The selection turn must use persisted state, not call the LLM again."""
 
@@ -953,6 +1058,306 @@ async def test_model_guest_count_with_transcript_evidence_updates_state() -> Non
         await database.dispose()
 
 
+async def test_provider_failure_keeps_explicit_devanagari_booking_turn_alive() -> None:
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=UnavailableHotelInterpreter(),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550109993")
+
+            response = await service.handle_turn(
+                conversation_id,
+                (
+                    "\u092e\u0941\u091d\u0947 \u0924\u0940\u0928 \u0932\u094b\u0917\u094b\u0902 "
+                    "\u0915\u0947 "
+                    "\u0932\u093f\u090f \u0915\u092e\u0930\u093e book "
+                    "\u0915\u0930\u0928\u093e \u0939\u0948."
+                ),
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            assert conversation.booking_guest_count == 3
+            assert response.intent == "booking"
+            assert "phir" not in response.say.casefold()
+    finally:
+        await database.dispose()
+
+
+async def test_provider_failure_does_not_drop_explicit_hinglish_dates() -> None:
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=UnknownHotelInterpreter(),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550109994")
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            conversation.booking_guest_count = 2
+            conversation.pending_category = "booking"
+            conversation.active_topic = "booking"
+            conversation.last_intent = "booking"
+            await service.store.add_turn(
+                conversation.id,
+                "assistant",
+                "Check-in aur check-out dates kya hongi?",
+            )
+            await session.commit()
+
+            response = await service.handle_turn(
+                conversation_id,
+                "तेरह August से लेकर पंद्रह August.",
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            assert conversation.booking_check_in == date(2026, 8, 13)
+            assert conversation.booking_check_out == date(2026, 8, 15)
+            assert "repeat" not in response.say.casefold()
+    finally:
+        await database.dispose()
+
+
+async def test_booking_dates_advance_when_semantic_parser_has_no_speech() -> None:
+    """Facts extracted by the parser must not depend on model-generated prose."""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=BookingDatesWithoutSpeechInterpreter(),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550109995")
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            conversation.booking_guest_count = 2
+            conversation.booking_plan_json = BookingPlan(
+                party_composition_known=True,
+            ).to_json()
+            conversation.pending_category = "booking"
+            conversation.active_topic = "booking"
+            conversation.last_intent = "booking"
+            await service.store.add_turn(
+                conversation.id,
+                "assistant",
+                "Check-in aur check-out dates kya hongi?",
+            )
+            await session.commit()
+
+            response = await service.handle_turn(
+                conversation_id,
+                (
+                    "\u0924\u0947\u0930\u0939 August \u0938\u0947 \u0932\u0947\u0915\u0930 "
+                    "\u092a\u0902\u0926\u094d\u0930\u0939 August."
+                ),
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            assert conversation.booking_check_in == date(2026, 8, 13)
+            assert conversation.booking_check_out == date(2026, 8, 15)
+            assert conversation.booking_nights == 2
+            assert "samajh nahi" not in response.say.casefold()
+            assert response.intent == "booking"
+    finally:
+        await database.dispose()
+
+
+async def test_party_composition_retries_provider_json_failure_without_blaming_caller() -> None:
+    """A transient parser failure must not turn a valid couples answer into a repeat."""
+
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "Failed to generate JSON. Please adjust your prompt. "
+                            "See 'failed_generation' for more details."
+                        )
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "intent": "booking",
+                                    "action": "answer",
+                                    "dialogue_act": "inform",
+                                    "command": "update_facts",
+                                    "booking_plan_json": {
+                                        "party_composition_known": True,
+                                        "party_groups": [
+                                            {
+                                                "label": "couple",
+                                                "people_per_group": 2,
+                                                "count": 1,
+                                            }
+                                        ],
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=OpenAIHotelTurnInterpreter(
+                    api_key="test-key",
+                    base_url="https://api.groq.com/openai/v1",
+                    model="qwen/qwen3.6-27b",
+                    reasoning_effort="none",
+                    client_factory=lambda: httpx.AsyncClient(
+                        transport=httpx.MockTransport(handler)
+                    ),
+                ),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550109993")
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            conversation.booking_guest_count = 3
+            conversation.booking_plan_json = BookingPlan().to_json()
+            conversation.pending_category = "booking"
+            conversation.active_topic = "booking"
+            conversation.last_intent = "booking"
+            await service.store.add_turn(
+                conversation.id,
+                "assistant",
+                "Theek hai, 3 guests hain. Kya group mein couples hain? Agar haan, kitne?",
+            )
+            await session.commit()
+
+            response = await service.handle_turn(
+                conversation_id,
+                "Ma'am, Group mein around ek couple hai.",
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            plan = BookingPlan.from_json(conversation.booking_plan_json)
+            assert len(requests) == 2
+            assert requests[0]["response_format"] == {"type": "json_object"}
+            assert len(requests[0]["messages"][0]["content"]) < 3_000
+            assert json.loads(requests[0]["messages"][1]["content"]) == {
+                "current_date": json.loads(requests[1]["messages"][1]["content"])[
+                    "current_date"
+                ],
+                "guest_text": "Ma'am, Group mein around ek couple hai.",
+                "response_language": "hinglish",
+                "last_assistant_turn": (
+                    "Theek hai, 3 guests hain. Kya group mein couples hain? "
+                    "Agar haan, kitne?"
+                ),
+                "pending_category": "booking",
+                "active_topic": "booking",
+                "last_intent": "booking",
+                "booking_guest_count": 3,
+                "booking_plan_json": BookingPlan().to_json(),
+                "expected_booking_slot": "party_composition",
+            }
+            assert plan.party_composition_known is True
+            assert [
+                (group.label, group.people_per_group, group.count)
+                for group in plan.party_groups
+            ] == [
+                ("couple", 2, 1)
+            ]
+            assert "sorry" not in response.say.casefold()
+            assert "phir bol" not in response.say.casefold()
+    finally:
+        await database.dispose()
+
+
+def test_local_date_fallback_recovers_explicit_hinglish_dates() -> None:
+    update = HotelConversationService._extract_booking_slot_update(
+        "Check in \u0939\u094b\u0902\u0917\u0940 \u0924\u0947\u0930\u0939 August \u0915\u0940 "
+        "checkout \u0939\u0948 \u092a\u0902\u0926\u094d\u0930\u0939.",
+        today=date(2026, 8, 10),
+    )
+
+    assert update.check_in == date(2026, 8, 13)
+    assert update.check_out == date(2026, 8, 15)
+
+
+def test_single_date_answer_uses_the_active_checkout_slot() -> None:
+    update = HotelConversationService._extract_booking_slot_update(
+        "\u092a\u0902\u0926\u094d\u0930\u0939 August.",
+        today=date(2026, 8, 10),
+        expected_date_slot="check_out",
+    )
+
+    assert update.check_in is None
+    assert update.check_out == date(2026, 8, 15)
+
+
+def test_booking_plan_confirmation_uses_spoken_layout_not_internal_json() -> None:
+    value = HotelConversationService._fact_value_label(
+        "booking_plan",
+        '{"party_composition_known":true,"room_count":2,"party_groups":[]}',
+    )
+
+    assert value == "2 rooms"
+    assert "{" not in value
+
+
+def test_explicit_devanagari_guest_count_recovers_when_model_omits_it() -> None:
+    interpretation = HotelTurnInterpretation(
+        intent="booking",
+        action="ask_slot",
+        response="Aap kitne guests ke liye booking chahte hain?",
+    )
+    caller_text = (
+        "\u092e\u0941\u091d\u0947 \u0924\u0940\u0928 \u0932\u094b\u0917\u094b\u0902 \u0915\u0947 "
+        "\u0932\u093f\u090f \u0915\u092e\u0930\u093e book \u0915\u0930\u0928\u093e \u0939\u0948."
+    )
+
+    update = HotelConversationService._booking_update_from_interpretation(
+        interpretation,
+        caller_text=caller_text,
+    )
+
+    assert update.guest_count == 3
+    assert update.guest_count_evidence_status == "explicit"
+
+
 async def test_booking_fact_correction_requires_confirmation_and_supersedes_old_value() -> None:
     database = Database("sqlite+aiosqlite:///:memory:")
     await database.create_schema()
@@ -986,8 +1391,13 @@ async def test_booking_fact_correction_requires_confirmation_and_supersedes_old_
             conversation = await service.store.conversation(conversation_id)
             assert conversation is not None
             assert "updated guest count to 6 guests" in confirmed.say
+            assert "Are any of them couples?" in confirmed.say
             assert conversation.booking_guest_count == 6
             assert '"status": "superseded"' in (conversation.booking_facts_json or "")
+
+            resumed = await service.handle_turn(conversation_id, "Okay.")
+            assert "Are any of them couples?" in resumed.say
+            assert "Sorry" not in resumed.say
     finally:
         await database.dispose()
 
@@ -1209,7 +1619,7 @@ async def test_no_single_room_fit_recommends_a_multi_room_offer_before_a_hold() 
             assert conversation is not None
             assert recommended.intent == "booking"
             assert "No single room fits 5 guests" in recommended.say
-            assert "I have 3 standard rooms and 2 suite rooms available" in recommended.say
+            assert "I have 3 standard rooms and 2 suite rooms available" not in recommended.say
             assert "I recommend 1 standard room and 1 suite room" in recommended.say
             assert "Would you like me to hold that exact layout?" in recommended.say
             assert conversation.booking_offer_id is not None
@@ -1287,6 +1697,129 @@ async def test_model_cannot_invent_room_quantity_in_booking_plan() -> None:
             conversation = await service.store.conversation(conversation_id)
             assert conversation is not None
             assert conversation.booking_plan_json is None
+    finally:
+        await database.dispose()
+
+
+async def test_room_count_turn_advances_to_the_next_missing_booking_fact() -> None:
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=RoomCountOnlyInterpreter(),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550107780")
+
+            response = await service.handle_turn(
+                conversation_id,
+                "मैं मुझे ना तीन कमरे book करने हैं.",
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            assert BookingPlan.from_json(
+                conversation.booking_plan_json
+            ).requested_room_count == 3
+            assert response.say == "Check-in aur check-out dates kya hongi?"
+            assert response.say != "Bilkul, aapko teen rooms book karne hain."
+    finally:
+        await database.dispose()
+
+
+async def test_model_omission_does_not_erase_explicit_hinglish_room_quantity() -> None:
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=PartyCompositionOnlyInterpreter(),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550107781")
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            plan = BookingPlan()
+            plan.apply_model_update(
+                party_groups=[
+                    {"label": "couple", "people_per_group": 2, "count": 1}
+                ],
+                party_composition_known=True,
+            )
+            conversation.booking_guest_count = 3
+            conversation.booking_plan_json = plan.to_json()
+            conversation.pending_category = "booking"
+            conversation.active_topic = "booking"
+            conversation.last_intent = "booking"
+            await session.commit()
+
+            response = await service.handle_turn(
+                conversation_id,
+                "दो rooms करवा दो.",
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            facts = json.loads(conversation.booking_facts_json or "{}")
+            pending_plan = next(
+                fact
+                for fact in facts["facts"]
+                if fact["field"] == "booking_plan"
+                and fact["status"] == "pending_confirmation"
+            )
+            assert BookingPlan.from_json(pending_plan["value"]).requested_room_count == 2
+            assert "2 rooms" in response.say
+            assert "{" not in response.say
+    finally:
+        await database.dispose()
+
+
+async def test_repeated_no_couples_answer_is_idempotent_and_advances_booking() -> None:
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    try:
+        async with database.session_factory() as session:
+            await seed_demo_hotel(session)
+            service = HotelConversationService(
+                session=session,
+                hotel_id=HOTEL_ID,
+                interpreter=NoCouplesInterpreter(),
+                response_language="hinglish",
+            )
+            conversation_id, _ = await service.start("+15550107782")
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            conversation.booking_guest_count = 3
+            conversation.pending_category = "booking"
+            conversation.active_topic = "booking"
+            conversation.last_intent = "booking"
+            await session.commit()
+
+            first = await service.handle_turn(
+                conversation_id,
+                "नहीं कोई भी couple नहीं.",
+            )
+            second = await service.handle_turn(
+                conversation_id,
+                "कोई भी couple नहीं है.",
+            )
+
+            conversation = await service.store.conversation(conversation_id)
+            assert conversation is not None
+            assert BookingPlan.from_json(
+                conversation.booking_plan_json
+            ).party_composition_known is True
+            assert "Check-in" in first.say or "check-in" in first.say
+            assert "Check-in" in second.say or "check-in" in second.say
+            assert "Sorry" not in second.say
+            assert "room layout" not in second.say
     finally:
         await database.dispose()
 

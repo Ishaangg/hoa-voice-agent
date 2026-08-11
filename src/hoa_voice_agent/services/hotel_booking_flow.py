@@ -40,11 +40,23 @@ _GUEST_NUMBER_WORDS = {
     "aath": 8,
     "nau": 9,
     "das": 10,
+    "एक": 1,
+    "दो": 2,
+    "तीन": 3,
+    "चार": 4,
+    "पाँच": 5,
+    "पांच": 5,
+    "छह": 6,
+    "छः": 6,
+    "सात": 7,
+    "आठ": 8,
+    "नौ": 9,
+    "दस": 10,
 }
 _GUEST_COUNT_PATTERN = "|".join(sorted(_GUEST_NUMBER_WORDS, key=len, reverse=True)) + r"|\d+"
 _GUEST_NOUN_PATTERN = (
     r"guests?|people|persons?|adults?|children?|kids?|members?|log(?:on)?|"
-    r"गेस्ट|मेहमान|लोग"
+    r"गेस्ट|मेहमान|लोग(?:ों|ो)?"
 )
 
 
@@ -90,8 +102,8 @@ def validate_guest_count_evidence(
     return GuestCountEvidence(guest_count, evidence, "explicit")
 
 
-def explicit_guest_count_from_text(text: str | None) -> int | None:
-    """Return a party size only when the caller explicitly states one.
+def explicit_guest_count_evidence_from_text(text: str | None) -> GuestCountEvidence:
+    """Extract a party size and its exact caller-text evidence when explicit.
 
     This does not infer a count from a room type, a recommendation, or a
     question asking how many guests there are.
@@ -99,16 +111,17 @@ def explicit_guest_count_from_text(text: str | None) -> int | None:
 
     normalized = " ".join((text or "").casefold().split())
     if not normalized:
-        return None
+        return GuestCountEvidence(None, None, "unknown")
     if re.search(
         r"(?:how many|kitne|कितने)\b.{0,40}(?:guest|people|person|adult|member|"
         r"गेस्ट|मेहमान|लोग)",
         normalized,
     ):
-        return None
+        return GuestCountEvidence(None, None, "unknown")
 
     patterns = (
-        rf"\b(?P<count>{_GUEST_COUNT_PATTERN})\s*(?:{_GUEST_NOUN_PATTERN})\b",
+        rf"\b(?P<count>{_GUEST_COUNT_PATTERN})\s*(?:{_GUEST_NOUN_PATTERN})"
+        rf"(?=\s|$|[,.!?])",
         rf"\b(?:{_GUEST_NOUN_PATTERN})\s*(?:will be|are|is|honge|hain|:)?\s*"
         rf"(?P<count>{_GUEST_COUNT_PATTERN})\b",
     )
@@ -119,8 +132,14 @@ def explicit_guest_count_from_text(text: str | None) -> int | None:
         raw_count = match.group("count")
         count = int(raw_count) if raw_count.isdigit() else _GUEST_NUMBER_WORDS[raw_count]
         if count >= 1:
-            return count
-    return None
+            return GuestCountEvidence(count, match.group(0), "explicit")
+    return GuestCountEvidence(None, None, "unknown")
+
+
+def explicit_guest_count_from_text(text: str | None) -> int | None:
+    """Return a party size only when the caller explicitly states one."""
+
+    return explicit_guest_count_evidence_from_text(text).guest_count
 
 
 @dataclass(frozen=True)

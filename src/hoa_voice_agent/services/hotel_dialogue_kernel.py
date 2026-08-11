@@ -50,6 +50,7 @@ ControllerAction = Literal[
     "reject_offer",
     "accept_pending_fact",
     "reject_pending_fact",
+    "resume_booking_prompt",
     "clarify",
     "ignore",
 ]
@@ -246,14 +247,16 @@ class HotelDialogueController:
         )
         if act in {"ask", "compare", "reject", "correct", "backchannel", "uncertain"}:
             caller_selected = False
+        caller_layout_fact = self._contains_caller_layout_fact(interpretation)
         can_update = bool(
             interpretation
             and interpretation.intent == "booking"
             and interpretation.booking_plan_json
+            and act not in {"ask", "compare", "reject", "backchannel", "uncertain"}
             and (
                 caller_selected
                 or (
-                    self._contains_party_composition_fact(interpretation)
+                    caller_layout_fact
                     and command.kind in {"update_facts", "inform", "select_option"}
                 )
             )
@@ -293,17 +296,26 @@ class HotelDialogueController:
         )
 
     @staticmethod
-    def _contains_party_composition_fact(
-        interpretation: HotelTurnInterpretation,
+    def _contains_caller_layout_fact(
+        interpretation: HotelTurnInterpretation | None,
     ) -> bool:
-        """Recognize structured party facts without classifying caller words."""
+        """Recognize caller-owned layout facts without interpreting caller text."""
 
+        if not interpretation or not interpretation.booking_plan_json:
+            return False
         try:
-            plan = json.loads(interpretation.booking_plan_json or "{}")
+            plan = json.loads(interpretation.booking_plan_json)
         except json.JSONDecodeError:
             return False
-        return isinstance(plan, dict) and (
-            "party_groups" in plan or plan.get("party_composition_known") is True
+        return isinstance(plan, dict) and any(
+            key in plan
+            for key in (
+                "party_groups",
+                "room_count",
+                "room_allocation",
+                "allocation_mode",
+                "party_composition_known",
+            )
         )
 
     @staticmethod
@@ -342,6 +354,16 @@ class HotelDialogueController:
         interpretation: Any | None,
     ) -> ControllerDecision:
         command = SemanticCommand.from_interpretation(interpretation)
+
+        if (
+            self._dialogue_act(interpretation) == "backchannel"
+            and snapshot.pending_category == "booking"
+        ):
+            return ControllerDecision(
+                action="resume_booking_prompt",
+                command=command.kind,
+                reason="caller_backchannel_during_booking_collection",
+            )
 
         if command.kind == "accept_offer":
             if snapshot.has_pending_fact_confirmation:

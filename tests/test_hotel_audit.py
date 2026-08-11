@@ -17,7 +17,7 @@ async def test_audit_log_writes_redacted_conversation_events(tmp_path) -> None:
         "llm_request",
         {
             "payload": {
-                "model": "gpt-5.6-luna",
+                "model": "llama-3.3-70b-versatile",
                 "api_key": "must-not-be-written",
                 "max_completion_tokens": 300,
             },
@@ -29,7 +29,7 @@ async def test_audit_log_writes_redacted_conversation_events(tmp_path) -> None:
     event = json.loads(line)
     assert event["conversation_id"] == str(conversation_id)
     assert event["event"] == "llm_request"
-    assert event["data"]["payload"]["model"] == "gpt-5.6-luna"
+    assert event["data"]["payload"]["model"] == "llama-3.3-70b-versatile"
     assert event["data"]["payload"]["api_key"] == "[REDACTED]"
     assert event["data"]["payload"]["max_completion_tokens"] == 300
     assert event["data"]["authorization"] == "[REDACTED]"

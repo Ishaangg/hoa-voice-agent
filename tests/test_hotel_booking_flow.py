@@ -5,6 +5,7 @@ from hoa_voice_agent.services.hotel_booking_flow import (
     BookingSlotUpdate,
     BookingStateSnapshot,
     HotelBookingFlow,
+    explicit_guest_count_evidence_from_text,
     explicit_guest_count_from_text,
     validate_guest_count_evidence,
 )
@@ -27,8 +28,23 @@ def _state(**overrides) -> BookingStateSnapshot:
 def test_guest_count_requires_caller_evidence() -> None:
     assert explicit_guest_count_from_text("Mujhe room for two guests chahiye.") == 2
     assert explicit_guest_count_from_text("Mujhe do logon ke liye room chahiye.") == 2
+    assert explicit_guest_count_from_text(
+        "\u092e\u0941\u091d\u0947 \u0924\u0940\u0928 \u0932\u094b\u0917\u094b\u0902 \u0915\u0947 "
+        "\u0932\u093f\u090f room chahiye."
+    ) == 3
     assert explicit_guest_count_from_text("Kitne guests ke liye booking hai?") is None
     assert explicit_guest_count_from_text("I need a standard room.") is None
+
+
+def test_devanagari_guest_count_keeps_verbatim_evidence() -> None:
+    result = explicit_guest_count_evidence_from_text(
+        "\u092e\u0941\u091d\u0947 \u0924\u0940\u0928 \u0932\u094b\u0917\u094b\u0902 \u0915\u0947 "
+        "\u0932\u093f\u090f room chahiye."
+    )
+
+    assert result.guest_count == 3
+    assert result.evidence == "\u0924\u0940\u0928 \u0932\u094b\u0917\u094b\u0902"
+    assert result.status == "explicit"
 
 
 def test_guest_count_evidence_accepts_natural_hinglish_without_keyword_matching() -> None:

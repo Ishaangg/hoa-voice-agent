@@ -283,6 +283,7 @@ class HotelBookingCoordinator:
                 guest_count=conversation.booking_guest_count,
                 date_range=date_range,
             ),
+            include_available_counts=False,
         )
 
     def verified_room_search_response(
@@ -723,6 +724,46 @@ class HotelBookingCoordinator:
         offer_response = await self.present_current_offer(conversation)
         assert offer_response is not None
         return offer_response
+
+    def progressive_booking_prompt(self, conversation) -> str | None:
+        """Return only the next missing booking question from current state."""
+
+        if not conversation.booking_check_in and not conversation.booking_check_out:
+            return self._text("booking_dates_only")
+        if not conversation.booking_check_in:
+            return self._text("booking_check_in")
+        if not conversation.booking_check_out:
+            return self._text("booking_check_out")
+        if not conversation.booking_guest_count:
+            return self._text("booking_guest_count")
+
+        plan = BookingPlan.from_json(conversation.booking_plan_json)
+        if (
+            conversation.booking_guest_count > 1
+            and not plan.party_composition_known
+            and not plan.has_exact_allocation
+        ):
+            return self._text(
+                "booking_party_composition",
+                guest_count=conversation.booking_guest_count,
+            )
+        if plan.party_size is not None and plan.party_size != conversation.booking_guest_count:
+            return self._text(
+                "booking_party_mismatch",
+                party_size=plan.party_size,
+                guest_count=conversation.booking_guest_count,
+            )
+        if plan.party_size is not None and plan.allow_room_sharing is None:
+            return room_split_prompt(plan)
+        if plan.party_size is not None and plan.requested_room_count is None:
+            return self._text("booking_room_count")
+        if plan.requested_room_count is not None and not plan.has_exact_allocation:
+            if plan.allow_mixed_types:
+                return self._text("booking_mixed_types")
+            return room_type_prompt(plan)
+        if not plan.has_exact_allocation:
+            return self._text("booking_room_type")
+        return None
 
     async def options_response(self, conversation, text: str) -> str:
         """Answer an alternatives question without changing the selected plan."""
